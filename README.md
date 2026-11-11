@@ -2,7 +2,9 @@
 
 **PlayView** es un monitor ligero de capturadoras para Windows. Está diseñado para mostrar la señal de una consola en una ventana sencilla, sin las funciones generales de un reproductor multimedia.
 
-> Versión de desarrollo: **0.2.4**. Esta versión define «Mostrar barra de opciones» como un ajuste exclusivo del modo ventana: activado mantiene la barra fija; desactivado la oculta y solo la muestra al acercar el cursor a la zona superior. En pantalla completa la barra siempre aparece y desaparece mediante el mismo comportamiento de proximidad, sin depender del ajuste guardado para ventana. El fondo rectangular gris de la barra se elimina: las etiquetas y el estado se dibujan directamente sobre el búfer de video. En PiP, los botones de acción usan el cursor normal y el cursor de movimiento queda reservado al área arrastrable. Se conserva el sistema de captura de audio y video de la versión anterior, que ya fue probado correctamente por el usuario. Aún debe compilarse en Windows y probarse esta revisión de interfaz en el equipo.
+> Versión de desarrollo: **0.2.5**. Esta versión define «Mostrar barra de opciones» como un ajuste exclusivo del modo ventana: activado mantiene la barra fija; desactivado la oculta y solo la muestra al acercar el cursor a la zona superior. En pantalla completa la barra siempre aparece y desaparece mediante el mismo comportamiento de proximidad, sin depender del ajuste guardado para ventana. El fondo rectangular gris de la barra se elimina: las etiquetas y el estado se dibujan directamente sobre el búfer de video. En PiP, los botones de acción usan el cursor normal y el cursor de movimiento queda reservado al área arrastrable. Se conserva el sistema de captura de audio y video de la versión anterior, que ya fue probado correctamente por el usuario. Aún debe compilarse en Windows y probarse esta revisión de interfaz en el equipo.
+
+En la versión **0.2.5**, la transición entre pantalla completa y ventana restaura el `WINDOWPLACEMENT` nativo que Windows tenía antes de entrar en pantalla completa. Esto conserva de forma conjunta el rectángulo normal, la posición y el estado maximizado, evitando que la ventana vuelva a un tamaño pequeño mientras Windows mantiene el botón de maximizar en estado activo. La restauración utiliza `SetWindowPlacement` en lugar de aplicar `rcNormalPosition` mediante `SetWindowPos`, porque ambas APIs interpretan las coordenadas de forma distinta.
 
 ## Funciones
 
@@ -114,8 +116,8 @@ Las instrucciones de publicación por Git también están en `INSTRUCCIONES_GITH
 Para generar una GitHub Release, crea y publica una etiqueta:
 
 ```powershell
-git tag v0.2.4
-git push origin v0.2.4
+git tag v0.2.5
+git push origin v0.2.5
 ```
 
 ## Perfiles: funcionamiento
@@ -177,3 +179,7 @@ Esta versión es una base de desarrollo y necesita validación con hardware real
 ## Corrección de compilación 0.2.1 (conservada en 0.2.4)
 
 Se deshabilita la inserción automática del manifiesto por parte del enlazador de MSVC (`/MANIFEST:NO`) porque el manifiesto personalizado ya se incorpora desde `resources/app.rc.in`. Esto evita el recurso `RT_MANIFEST` duplicado que provocaba `CVTRES : fatal error CVT1100`. También se explicitan las conversiones de los índices de flujo de Media Foundation para eliminar las advertencias C4245 y se elimina el nombre de un parámetro no utilizado.
+
+## Cambios de la versión 0.2.5
+
+Se corrige la restauración de la ventana al salir de pantalla completa con F11 o Esc. Antes de entrar en pantalla completa se guarda la estructura completa `WINDOWPLACEMENT` de Windows. Al regresar, se restaura el marco normal y se aplica esa estructura con el estado correcto (`SW_SHOWMAXIMIZED` o `SW_SHOWNORMAL`). Así se evita el desfase entre el tamaño visible y el estado interno que provocaba tener que pulsar dos veces el botón de maximizar. La captura de audio y video, PiP y la barra de opciones no se modifican en esta corrección.
