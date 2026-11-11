@@ -2195,7 +2195,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case IDM_VIEW_FULLSCREEN: SetWindowMode(g_windowMode == 2 ? 0 : 2); return 0;
         case IDM_EXIT: PostMessageW(hwnd, WM_CLOSE, 0, 0); return 0;
         case IDM_ABOUT:
-            MessageBoxW(hwnd, L"PlayView 0.2.5\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation.",
+            MessageBoxW(hwnd, L"PlayView 1.0.0\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation.",
                 L"Acerca de PlayView", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
