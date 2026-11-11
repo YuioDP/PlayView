@@ -3,6 +3,7 @@
 #include <commctrl.h>
 #include <mfapi.h>
 #include <mfidl.h>
+#include <mfobjects.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
 #include <mmdeviceapi.h>
@@ -50,7 +51,9 @@ constexpr UINT WM_APP_FRAME = WM_APP + 1;
 constexpr UINT WM_APP_VIDEO_READY = WM_APP + 2;
 constexpr UINT WM_APP_VIDEO_LOST = WM_APP + 3;
 constexpr UINT WM_APP_AUDIO_LOST = WM_APP + 4;
+constexpr UINT WM_APP_REBUILD_MENU = WM_APP + 5;
 constexpr UINT_PTR TIMER_RECONNECT = 1;
+constexpr UINT_PTR TIMER_OVERLAY = 2;
 
 constexpr int IDC_VIDEO_DEVICE = 1001;
 constexpr int IDC_AUDIO_DEVICE = 1002;
@@ -65,6 +68,7 @@ constexpr int IDC_VIDEO_LABEL = 1010;
 constexpr int IDC_AUDIO_LABEL = 1011;
 constexpr int IDC_RES_LABEL = 1012;
 constexpr int IDC_VOLUME_LABEL = 1013;
+constexpr int IDC_TOOLBAR_BACKGROUND = 1014;
 constexpr int IDM_VIEW_WINDOW = 2001;
 constexpr int IDM_VIEW_BORDERLESS = 2002;
 constexpr int IDM_VIEW_FULLSCREEN = 2003;
@@ -101,6 +105,11 @@ struct Settings {
     int volume = 80;
     bool muted = false;
     int windowMode = 0; // 0 windowed, 1 borderless, 2 fullscreen
+    bool windowMaximized = false;
+    int windowX = 100;
+    int windowY = 100;
+    int windowWidth = 1180;
+    int windowHeight = 760;
 };
 
 struct ProfileEntry {
@@ -115,15 +124,31 @@ struct FrameData {
     int height = 0;
 };
 
+struct PaintBuffer {
+    HDC dc = nullptr;
+    HBITMAP bitmap = nullptr;
+    HGDIOBJ previousBitmap = nullptr;
+    HBRUSH backgroundBrush = nullptr;
+    int width = 0;
+    int height = 0;
+};
+
 HWND g_hwnd = nullptr;
 HWND g_pipHwnd = nullptr;
 HWND g_videoCombo = nullptr;
 HWND g_audioCombo = nullptr;
 HWND g_resolutionCombo = nullptr;
 HWND g_volumeSlider = nullptr;
+HWND g_volumeTooltip = nullptr;
 HWND g_muteButton = nullptr;
+std::wstring g_volumeTooltipText;
+bool g_volumeTooltipVisible = false;
 HWND g_status = nullptr;
+HWND g_toolbarBackground = nullptr;
 HFONT g_uiFont = nullptr;
+HMENU g_appMenu = nullptr;
+PaintBuffer g_mainPaintBuffer;
+PaintBuffer g_pipPaintBuffer;
 
 Settings g_settings;
 std::vector<DeviceInfo> g_videoDevices;
@@ -141,9 +166,12 @@ std::wstring g_videoStatus = L"Selecciona una capturadora para comenzar.";
 std::wstring g_audioStatus = L"Audio sin configurar.";
 ULONGLONG g_nextVideoRetry = 0;
 ULONGLONG g_nextAudioRetry = 0;
-RECT g_restoreRect{ 0, 0, 1180, 760 };
+RECT g_restoreRect{ 100, 100, 1280, 860 };
 int g_windowMode = 0;
+bool g_windowMaximized = false;
 bool g_isChangingWindowMode = false;
+bool g_preserveRestoreRect = false;
+bool g_overlayVisible = true;
 std::filesystem::path g_appDirectory;
 std::filesystem::path g_settingsPath;
 std::filesystem::path g_logPath;
@@ -158,6 +186,11 @@ void RefreshDevices(bool initial = false);
 void SetWindowMode(int mode);
 void CreateAppMenu(HWND hwnd);
 void TogglePipTopmost();
+void UpdateOverlayVisibility(bool force = false);
+void InvalidateVideoSurface(HWND target);
+void CaptureNormalWindowPlacement();
+void RequestMenuRebuild();
+void ApplyLoadedWindowPreferences();
 
 void Log(const std::wstring& message) {
     if (g_logPath.empty()) return;
@@ -214,6 +247,20 @@ std::filesystem::path CurrentSettingsFile() {
     return g_activeProfilePath.empty() ? g_settingsPath : g_activeProfilePath;
 }
 
+void CaptureNormalWindowPlacement() {
+    if (!g_hwnd || g_windowMode != 0 || g_isChangingWindowMode) return;
+    WINDOWPLACEMENT placement{};
+    placement.length = sizeof(placement);
+    if (!GetWindowPlacement(g_hwnd, &placement)) return;
+    if (IsIconic(g_hwnd)) return;
+
+    g_windowMaximized = placement.showCmd == SW_SHOWMAXIMIZED || IsZoomed(g_hwnd) != FALSE;
+    const RECT normal = placement.rcNormalPosition;
+    if (normal.right - normal.left >= 500 && normal.bottom - normal.top >= 300) {
+        g_restoreRect = normal;
+    }
+}
+
 void LoadSettingsFrom(const std::filesystem::path& path) {
     const auto previous = g_settingsPath;
     g_settingsPath = path;
@@ -226,6 +273,14 @@ void LoadSettingsFrom(const std::filesystem::path& path) {
     g_settings.volume = std::clamp(ReadIniInt(L"Audio", L"Volume", 80), 0, 100);
     g_settings.muted = ReadIniInt(L"Audio", L"Muted", 0) != 0;
     g_settings.windowMode = std::clamp(ReadIniInt(L"Window", L"Mode", 0), 0, 2);
+    g_settings.windowMaximized = ReadIniInt(L"Window", L"Maximized", 0) != 0;
+    g_settings.windowX = ReadIniInt(L"Window", L"X", 100);
+    g_settings.windowY = ReadIniInt(L"Window", L"Y", 100);
+    g_settings.windowWidth = std::max(950, ReadIniInt(L"Window", L"Width", 1180));
+    g_settings.windowHeight = std::max(440, ReadIniInt(L"Window", L"Height", 760));
+    g_windowMaximized = g_settings.windowMaximized;
+    g_restoreRect = { g_settings.windowX, g_settings.windowY,
+        g_settings.windowX + g_settings.windowWidth, g_settings.windowY + g_settings.windowHeight };
     g_volume.store(g_settings.volume);
     g_muted.store(g_settings.muted);
     g_settingsPath = previous;
@@ -236,6 +291,12 @@ void LoadSettings() {
 }
 
 void SaveSettingsTo(const std::filesystem::path& path) {
+    CaptureNormalWindowPlacement();
+    g_settings.windowMaximized = g_windowMaximized;
+    g_settings.windowX = g_restoreRect.left;
+    g_settings.windowY = g_restoreRect.top;
+    g_settings.windowWidth = std::max(950L, g_restoreRect.right - g_restoreRect.left);
+    g_settings.windowHeight = std::max(440L, g_restoreRect.bottom - g_restoreRect.top);
     const auto previous = g_settingsPath;
     g_settingsPath = path;
     WriteIniString(L"Devices", L"VideoId", g_settings.videoId);
@@ -247,6 +308,11 @@ void SaveSettingsTo(const std::filesystem::path& path) {
     WriteIniString(L"Audio", L"Volume", std::to_wstring(g_settings.volume));
     WriteIniString(L"Audio", L"Muted", g_settings.muted ? L"1" : L"0");
     WriteIniString(L"Window", L"Mode", std::to_wstring(g_windowMode));
+    WriteIniString(L"Window", L"Maximized", g_windowMaximized ? L"1" : L"0");
+    WriteIniString(L"Window", L"X", std::to_wstring(g_restoreRect.left));
+    WriteIniString(L"Window", L"Y", std::to_wstring(g_restoreRect.top));
+    WriteIniString(L"Window", L"Width", std::to_wstring(g_restoreRect.right - g_restoreRect.left));
+    WriteIniString(L"Window", L"Height", std::to_wstring(g_restoreRect.bottom - g_restoreRect.top));
     g_settingsPath = previous;
 }
 
@@ -257,22 +323,27 @@ void SaveSettings() {
 std::vector<ProfileEntry> EnumerateProfiles() {
     std::vector<ProfileEntry> profiles;
     std::error_code ec;
-    if (!std::filesystem::exists(g_profilesDirectory, ec)) return profiles;
-    for (const auto& item : std::filesystem::directory_iterator(g_profilesDirectory, ec)) {
-        if (ec || !item.is_regular_file()) continue;
-        if (_wcsicmp(item.path().extension().c_str(), L".ini") != 0) continue;
-        ProfileEntry profile;
-        profile.path = item.path();
-        wchar_t value[32768]{};
-        GetPrivateProfileStringW(L"Profile", L"Name", item.path().stem().c_str(), value,
-            static_cast<DWORD>(std::size(value)), item.path().c_str());
-        profile.name = value;
-        wchar_t iconValue[32768]{};
-        GetPrivateProfileStringW(L"Profile", L"IconPath", L"", iconValue,
-            static_cast<DWORD>(std::size(iconValue)), item.path().c_str());
-        if (iconValue[0]) profile.iconPath = iconValue;
-        if (profile.name.empty()) profile.name = item.path().stem().wstring();
-        profiles.push_back(std::move(profile));
+    std::filesystem::directory_iterator iterator(g_profilesDirectory, ec);
+    const std::filesystem::directory_iterator end;
+    while (!ec && iterator != end) {
+        const auto path = iterator->path();
+        std::error_code typeError;
+        if (iterator->is_regular_file(typeError) && !typeError &&
+            _wcsicmp(path.extension().c_str(), L".ini") == 0) {
+            ProfileEntry profile;
+            profile.path = path;
+            wchar_t value[32768]{};
+            GetPrivateProfileStringW(L"Profile", L"Name", path.stem().c_str(), value,
+                static_cast<DWORD>(std::size(value)), path.c_str());
+            profile.name = value;
+            wchar_t iconValue[32768]{};
+            GetPrivateProfileStringW(L"Profile", L"IconPath", L"", iconValue,
+                static_cast<DWORD>(std::size(iconValue)), path.c_str());
+            if (iconValue[0]) profile.iconPath = iconValue;
+            if (profile.name.empty()) profile.name = path.stem().wstring();
+            profiles.push_back(std::move(profile));
+        }
+        iterator.increment(ec);
     }
     std::sort(profiles.begin(), profiles.end(), [](const ProfileEntry& a, const ProfileEntry& b) {
         return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0;
@@ -488,57 +559,85 @@ void RebuildProfilesMenu(HMENU menu) {
 }
 
 void SaveCurrentAsProfile() {
-    wchar_t file[MAX_PATH] = L"Nuevo perfil.ini";
-    OPENFILENAMEW dialog{};
-    dialog.lStructSize = sizeof(dialog);
-    dialog.hwndOwner = g_hwnd;
-    dialog.lpstrFilter = L"Perfil PlayView (*.ini)\0*.ini\0";
-    dialog.lpstrFile = file;
-    dialog.nMaxFile = static_cast<DWORD>(std::size(file));
-    dialog.lpstrInitialDir = g_profilesDirectory.c_str();
-    dialog.lpstrTitle = L"Guardar perfil de PlayView";
-    dialog.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_EXPLORER;
-    dialog.lpstrDefExt = L"ini";
-    if (!GetSaveFileNameW(&dialog)) return;
-    std::filesystem::path profilePath = file;
-    if (profilePath.extension().empty()) profilePath += L".ini";
-    std::error_code pathError;
-    const auto profileRoot = std::filesystem::weakly_canonical(g_profilesDirectory, pathError);
-    const auto chosenRoot = std::filesystem::weakly_canonical(profilePath.parent_path(), pathError);
-    if (pathError || _wcsicmp(chosenRoot.c_str(), profileRoot.c_str()) != 0) {
-        MessageBoxW(g_hwnd, L"Los perfiles deben guardarse dentro de la carpeta de datos de PlayView.", L"PlayView", MB_OK | MB_ICONWARNING);
-        return;
-    }
-    const std::wstring profileName = profilePath.stem().wstring();
+    try {
+        wchar_t file[MAX_PATH] = L"Nuevo perfil.ini";
+        OPENFILENAMEW dialog{};
+        dialog.lStructSize = sizeof(dialog);
+        dialog.hwndOwner = g_hwnd;
+        dialog.lpstrFilter = L"Perfil PlayView (*.ini)\0*.ini\0";
+        dialog.lpstrFile = file;
+        dialog.nMaxFile = static_cast<DWORD>(std::size(file));
+        dialog.lpstrInitialDir = g_profilesDirectory.c_str();
+        dialog.lpstrTitle = L"Guardar perfil de PlayView";
+        dialog.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_EXPLORER;
+        dialog.lpstrDefExt = L"ini";
+        if (!GetSaveFileNameW(&dialog)) return;
 
-    std::filesystem::path iconSource;
-    if (MessageBoxW(g_hwnd, L"¿Deseas asignar un logo personalizado a este perfil? Se admiten .ico, .png, .jpg, .jpeg y .bmp. Se convertirán al formato de icono de Windows.",
-        L"Logo del perfil", MB_YESNO | MB_ICONQUESTION) == IDYES) {
-        if (!PickIconFile(iconSource)) iconSource.clear();
-    }
-
-    std::filesystem::path iconDestination;
-    if (!iconSource.empty()) {
-        iconDestination = g_profileIconsDirectory / (profilePath.stem().wstring() + L".ico");
-        if (!SaveProfileIcon(iconSource, iconDestination)) {
-            MessageBoxW(g_hwnd, L"No se pudo copiar el icono. Se utilizará el icono predeterminado.", L"PlayView", MB_OK | MB_ICONWARNING);
-            iconDestination.clear();
+        std::filesystem::path profilePath(file);
+        if (profilePath.extension().empty()) profilePath += L".ini";
+        std::error_code rootError, chosenError;
+        const auto profileRoot = std::filesystem::weakly_canonical(g_profilesDirectory, rootError);
+        const auto chosenRoot = std::filesystem::weakly_canonical(profilePath.parent_path(), chosenError);
+        if (rootError || chosenError || CompareStringOrdinal(profileRoot.c_str(), -1,
+            chosenRoot.c_str(), -1, TRUE) != CSTR_EQUAL) {
+            MessageBoxW(g_hwnd, L"Los perfiles deben guardarse dentro de la carpeta de datos de PlayView.",
+                L"PlayView", MB_OK | MB_ICONWARNING);
+            return;
         }
-    }
 
-    SaveSettingsTo(profilePath);
-    WritePrivateProfileStringW(L"Profile", L"Name", profileName.c_str(), profilePath.c_str());
-    WritePrivateProfileStringW(L"Profile", L"IconPath", iconDestination.empty() ? L"" : iconDestination.c_str(), profilePath.c_str());
-    ProfileEntry profile{ profileName, profilePath, iconDestination };
-    CreateAppMenu(g_hwnd);
+        const std::wstring profileName = profilePath.stem().wstring();
+        if (profileName.empty()) {
+            MessageBoxW(g_hwnd, L"El nombre del perfil no es válido.", L"PlayView", MB_OK | MB_ICONWARNING);
+            return;
+        }
 
-    if (MessageBoxW(g_hwnd, L"El perfil se guardó. ¿Deseas crear ahora un acceso directo en el escritorio con su nombre y logo?",
-        L"Perfil creado", MB_YESNO | MB_ICONQUESTION) == IDYES) {
-        if (CreateProfileShortcut(profile)) MessageBoxW(g_hwnd, L"Acceso directo creado en el escritorio.", L"PlayView", MB_OK | MB_ICONINFORMATION);
-        else MessageBoxW(g_hwnd, L"No se pudo crear el acceso directo.", L"PlayView", MB_OK | MB_ICONWARNING);
+        std::filesystem::path iconSource;
+        if (MessageBoxW(g_hwnd,
+            L"¿Deseas asignar un logo personalizado a este perfil? Se admiten .ico, .png, .jpg, .jpeg y .bmp.",
+            L"Logo del perfil", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            if (!PickIconFile(iconSource)) iconSource.clear();
+        }
+
+        std::filesystem::path iconDestination;
+        if (!iconSource.empty()) {
+            iconDestination = g_profileIconsDirectory / (profilePath.stem().wstring() + L".ico");
+            if (!SaveProfileIcon(iconSource, iconDestination)) {
+                MessageBoxW(g_hwnd, L"No se pudo copiar el icono. Se utilizará el icono predeterminado.",
+                    L"PlayView", MB_OK | MB_ICONWARNING);
+                iconDestination.clear();
+            }
+        }
+
+        SaveSettingsTo(profilePath);
+        WritePrivateProfileStringW(L"Profile", L"Name", profileName.c_str(), profilePath.c_str());
+        WritePrivateProfileStringW(L"Profile", L"IconPath",
+            iconDestination.empty() ? L"" : iconDestination.c_str(), profilePath.c_str());
+
+        ProfileEntry profile{ profileName, profilePath, iconDestination };
+        RequestMenuRebuild();
+        if (MessageBoxW(g_hwnd,
+            L"El perfil se guardó. ¿Deseas crear ahora un acceso directo en el escritorio con su nombre y logo?",
+            L"Perfil creado", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            if (CreateProfileShortcut(profile))
+                MessageBoxW(g_hwnd, L"Acceso directo creado en el escritorio.", L"PlayView", MB_OK | MB_ICONINFORMATION);
+            else
+                MessageBoxW(g_hwnd, L"No se pudo crear el acceso directo.", L"PlayView", MB_OK | MB_ICONWARNING);
+        }
+    } catch (const std::filesystem::filesystem_error& error) {
+        (void)error;
+        Log(L"Error de archivos al guardar perfil.");
+        MessageBoxW(g_hwnd, L"Ocurrió un problema al guardar el perfil. Consulta playview.log para más detalles.",
+            L"PlayView", MB_OK | MB_ICONERROR);
+    } catch (const std::exception&) {
+        Log(L"Error de ejecución al guardar un perfil.");
+        MessageBoxW(g_hwnd, L"Ocurrió un error al guardar el perfil. La aplicación continuará abierta.",
+            L"PlayView", MB_OK | MB_ICONERROR);
+    } catch (...) {
+        Log(L"Error inesperado al guardar un perfil.");
+        MessageBoxW(g_hwnd, L"Ocurrió un error inesperado al guardar el perfil. La aplicación continuará abierta.",
+            L"PlayView", MB_OK | MB_ICONERROR);
     }
 }
-
 
 std::wstring GetAttributeString(IMFAttributes* attributes, REFGUID key) {
     if (!attributes) return {};
@@ -671,6 +770,9 @@ private:
             ComPtr<IMFAttributes> readerAttributes;
             hr = MFCreateAttributes(&readerAttributes, 2);
             if (SUCCEEDED(hr)) hr = readerAttributes->SetUINT32(MF_LOW_LATENCY, TRUE);
+            // Keep the advanced Source Reader processor enabled for real-time
+            // format conversion. It supports the conversion/deinterlace path
+            // and can use a registered hardware video processor when available.
             if (SUCCEEDED(hr)) hr = readerAttributes->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE);
             if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromMediaSource(source.Get(), readerAttributes.Get(), &reader);
         }
@@ -708,6 +810,7 @@ private:
         }
 
         bool signaledReady = false;
+        FrameData nextFrame;
         while (!stopRequested_.load()) {
             DWORD streamIndex = 0, flags = 0;
             LONGLONG timestamp = 0;
@@ -733,26 +836,60 @@ private:
             ComPtr<IMFMediaBuffer> buffer;
             hr = sample->ConvertToContiguousBuffer(&buffer);
             if (FAILED(hr)) continue;
-            BYTE* data = nullptr;
-            DWORD maxLength = 0, currentLength = 0;
-            hr = buffer->Lock(&data, &maxLength, &currentLength);
-            if (FAILED(hr)) continue;
-            if (!data) { buffer->Unlock(); continue; }
-
             const size_t rowBytes = static_cast<size_t>(frameWidth) * 4;
-            const size_t absStride = static_cast<size_t>(stride < 0 ? -stride : stride);
-            const size_t requiredBytes = absStride * frameHeight;
-            if (currentLength >= requiredBytes && absStride >= rowBytes) {
+            const size_t frameBytes = rowBytes * frameHeight;
+            nextFrame.width = static_cast<int>(frameWidth);
+            nextFrame.height = static_cast<int>(frameHeight);
+            if (nextFrame.pixels.size() != frameBytes) nextFrame.pixels.resize(frameBytes);
+            bool copiedFrame = false;
+
+            // Prefer IMF2DBuffer::Lock2D. It supplies the actual first scanline
+            // and signed pitch, avoiding assumptions about the driver's layout.
+            ComPtr<IMF2DBuffer> buffer2D;
+            if (SUCCEEDED(buffer.As(&buffer2D))) {
+                BYTE* scanline0 = nullptr;
+                LONG pitch = 0;
+                if (SUCCEEDED(buffer2D->Lock2D(&scanline0, &pitch))) {
+                    const size_t absPitch = static_cast<size_t>(pitch < 0 ? -static_cast<int64_t>(pitch) : pitch);
+                    if (scanline0 && absPitch >= rowBytes && rowBytes <= MAXDWORD) {
+                        copiedFrame = SUCCEEDED(MFCopyImage(nextFrame.pixels.data(),
+                            static_cast<LONG>(rowBytes), scanline0, pitch,
+                            static_cast<DWORD>(rowBytes), frameHeight));
+                    }
+                    buffer2D->Unlock2D();
+                }
+            }
+
+            // Some drivers expose only IMFMediaBuffer::Lock. Keep a guarded
+            // fallback for them, but do the copy outside the paint mutex.
+            if (!copiedFrame) {
+                BYTE* data = nullptr;
+                DWORD maxLength = 0, currentLength = 0;
+                hr = buffer->Lock(&data, &maxLength, &currentLength);
+                if (SUCCEEDED(hr)) {
+                    const size_t absStride = static_cast<size_t>(stride < 0
+                        ? -static_cast<int64_t>(stride) : stride);
+                    const size_t requiredBytes = absStride * frameHeight;
+                    if (data && absStride >= rowBytes && currentLength >= requiredBytes) {
+                        for (UINT32 row = 0; row < frameHeight; ++row) {
+                            const UINT32 sourceRow = stride < 0 ? (frameHeight - 1 - row) : row;
+                            std::memcpy(nextFrame.pixels.data() + static_cast<size_t>(row) * rowBytes,
+                                data + static_cast<size_t>(sourceRow) * absStride, rowBytes);
+                        }
+                        copiedFrame = true;
+                    }
+                    buffer->Unlock();
+                }
+            }
+
+            if (copiedFrame) {
                 {
                     std::lock_guard<std::mutex> lock(g_frameMutex);
-                    g_latestFrame.width = static_cast<int>(frameWidth);
-                    g_latestFrame.height = static_cast<int>(frameHeight);
-                    g_latestFrame.pixels.resize(rowBytes * frameHeight);
-                    for (UINT32 row = 0; row < frameHeight; ++row) {
-                        const UINT32 sourceRow = stride < 0 ? (frameHeight - 1 - row) : row;
-                        std::memcpy(g_latestFrame.pixels.data() + static_cast<size_t>(row) * rowBytes,
-                                    data + static_cast<size_t>(sourceRow) * absStride, rowBytes);
-                    }
+                    g_latestFrame.width = nextFrame.width;
+                    g_latestFrame.height = nextFrame.height;
+                    // Swap rather than resize/copy under the mutex. The UI can
+                    // finish drawing the previous frame before the next one is published.
+                    g_latestFrame.pixels.swap(nextFrame.pixels);
                 }
                 g_videoHasFrame.store(true);
                 g_lastVideoFrameTick.store(GetTickCount64());
@@ -762,7 +899,6 @@ private:
                 }
                 if (!g_frameMessagePending.exchange(true)) PostMessageW(notifyWindow, WM_APP_FRAME, 0, 0);
             }
-            buffer->Unlock();
         }
 
         reader.Reset();
@@ -933,21 +1069,20 @@ void ApplyPipZOrder() {
 }
 
 void LoadProfile(const ProfileEntry& profile) {
+    if (g_windowMode != 0) SetWindowMode(0);
     SaveSettings();
     if (g_videoCapture.IsRunning()) g_videoCapture.Stop();
     if (g_audioCapture.IsRunning()) g_audioCapture.Stop();
     g_activeProfilePath = profile.path;
     g_activeProfileName = profile.name;
     LoadSettingsFrom(g_activeProfilePath);
-    ApplyPipZOrder();
-    CreateAppMenu(g_hwnd);
-    g_windowMode = 0;
+    RequestMenuRebuild();
     SetWindowTextW(g_hwnd, (L"PlayView | " + g_activeProfileName).c_str());
     SendMessageW(g_volumeSlider, TBM_SETPOS, TRUE, g_settings.volume);
     SetWindowTextW(GetDlgItem(g_hwnd, IDC_VOLUME_LABEL), (L"Volumen: " + std::to_wstring(g_settings.volume) + L"%").c_str());
     SetWindowTextW(g_muteButton, g_settings.muted ? L"Activar" : L"Silenciar");
+    ApplyLoadedWindowPreferences();
     RefreshDevices(true);
-    if (g_settings.windowMode != 0) SetWindowMode(g_settings.windowMode);
     Log(L"Perfil cargado: " + profile.name);
 }
 
@@ -961,7 +1096,7 @@ void DeleteProfile(const ProfileEntry& profile) {
     std::error_code ec;
     std::filesystem::remove(profile.path, ec);
     if (!profile.iconPath.empty()) std::filesystem::remove(profile.iconPath, ec);
-    CreateAppMenu(g_hwnd);
+    RequestMenuRebuild();
 }
 
 void ChangeProfileIcon(const ProfileEntry& profile) {
@@ -973,12 +1108,66 @@ void ChangeProfileIcon(const ProfileEntry& profile) {
         return;
     }
     WritePrivateProfileStringW(L"Profile", L"IconPath", destination.c_str(), profile.path.c_str());
-    CreateAppMenu(g_hwnd);
+    RequestMenuRebuild();
 }
 
 
 void SetControlFont(HWND control) {
     if (control && g_uiFont) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+}
+
+void UpdateVolumeTooltip() {
+    if (!g_volumeTooltip || !g_volumeSlider) return;
+    g_volumeTooltipText = std::to_wstring(
+        static_cast<int>(SendMessageW(g_volumeSlider, TBM_GETPOS, 0, 0))) + L"%";
+    TOOLINFOW tool{};
+    tool.cbSize = sizeof(tool);
+    tool.uFlags = TTF_IDISHWND | TTF_TRACK | TTF_ABSOLUTE;
+    tool.hwnd = g_hwnd;
+    tool.uId = reinterpret_cast<UINT_PTR>(g_volumeSlider);
+    tool.lpszText = const_cast<LPWSTR>(g_volumeTooltipText.c_str());
+    SendMessageW(g_volumeTooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
+
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    SendMessageW(g_volumeTooltip, TTM_TRACKPOSITION, 0,
+        MAKELPARAM(static_cast<SHORT>(cursor.x), static_cast<SHORT>(cursor.y - 26)));
+    SendMessageW(g_volumeTooltip, TTM_TRACKACTIVATE, TRUE, reinterpret_cast<LPARAM>(&tool));
+    g_volumeTooltipVisible = true;
+}
+
+void HideVolumeTooltip() {
+    if (!g_volumeTooltip || !g_volumeTooltipVisible || !g_volumeSlider) return;
+    TOOLINFOW tool{};
+    tool.cbSize = sizeof(tool);
+    tool.uFlags = TTF_IDISHWND | TTF_TRACK | TTF_ABSOLUTE;
+    tool.hwnd = g_hwnd;
+    tool.uId = reinterpret_cast<UINT_PTR>(g_volumeSlider);
+    tool.lpszText = const_cast<LPWSTR>(g_volumeTooltipText.c_str());
+    SendMessageW(g_volumeTooltip, TTM_TRACKACTIVATE, FALSE, reinterpret_cast<LPARAM>(&tool));
+    g_volumeTooltipVisible = false;
+}
+
+LRESULT CALLBACK VolumeSliderSubclass(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
+                                      UINT_PTR subclassId, DWORD_PTR referenceData) {
+    (void)wParam;
+    (void)lParam;
+    (void)referenceData;
+    switch (message) {
+    case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT tracking{ sizeof(tracking), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tracking);
+        UpdateVolumeTooltip();
+        break;
+    }
+    case WM_MOUSELEAVE:
+        HideVolumeTooltip();
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, VolumeSliderSubclass, subclassId);
+        break;
+    }
+    return DefSubclassProc(hwnd, message, wParam, lParam);
 }
 
 HWND AddControl(DWORD exStyle, const wchar_t* className, const wchar_t* text, DWORD style,
@@ -1105,7 +1294,7 @@ void StartSelectedVideo(bool showErrorIfMissing = true) {
         g_videoCapture.Start(g_hwnd, g_settings.videoId, g_settings.width, g_settings.height);
     }
     UpdateStatusText();
-    InvalidateRect(g_hwnd, nullptr, FALSE);
+    InvalidateVideoSurface(g_hwnd);
 }
 
 void StartSelectedAudio(bool showErrorIfMissing = false) {
@@ -1171,19 +1360,34 @@ void SetWindowMode(int mode) {
     mode = std::clamp(mode, 0, 2);
     if (!g_hwnd || g_isChangingWindowMode || mode == g_windowMode) return;
     g_isChangingWindowMode = true;
-    if (g_windowMode == 0) GetWindowRect(g_hwnd, &g_restoreRect);
+
+    if (g_windowMode == 0 && mode != 0 && !g_preserveRestoreRect) {
+        WINDOWPLACEMENT placement{};
+        placement.length = sizeof(placement);
+        if (GetWindowPlacement(g_hwnd, &placement)) {
+            g_restoreRect = placement.rcNormalPosition;
+            g_windowMaximized = placement.showCmd == SW_SHOWMAXIMIZED || IsZoomed(g_hwnd) != FALSE;
+        } else {
+            GetWindowRect(g_hwnd, &g_restoreRect);
+            g_windowMaximized = IsZoomed(g_hwnd) != FALSE;
+        }
+    }
 
     LONG_PTR style = GetWindowLongPtrW(g_hwnd, GWL_STYLE);
     if (mode == 0) {
         style &= ~static_cast<LONG_PTR>(WS_POPUP);
-        style |= WS_OVERLAPPEDWINDOW;
+        style |= WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
         SetWindowLongPtrW(g_hwnd, GWL_STYLE, style);
+        if (g_appMenu) SetMenu(g_hwnd, g_appMenu);
         SetWindowPos(g_hwnd, nullptr, g_restoreRect.left, g_restoreRect.top,
             g_restoreRect.right - g_restoreRect.left, g_restoreRect.bottom - g_restoreRect.top,
             SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        ShowWindow(g_hwnd, g_windowMaximized ? SW_MAXIMIZE : SW_RESTORE);
+        DrawMenuBar(g_hwnd);
     } else {
+        SetMenu(g_hwnd, nullptr);
         style &= ~static_cast<LONG_PTR>(WS_OVERLAPPEDWINDOW);
-        style |= WS_POPUP;
+        style |= WS_POPUP | WS_CLIPCHILDREN;
         SetWindowLongPtrW(g_hwnd, GWL_STYLE, style);
         if (mode == 1) {
             SetWindowPos(g_hwnd, nullptr, g_restoreRect.left, g_restoreRect.top,
@@ -1196,15 +1400,45 @@ void SetWindowMode(int mode) {
             SetWindowPos(g_hwnd, HWND_TOP, target.left, target.top, target.right - target.left,
                 target.bottom - target.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         }
+        DrawMenuBar(g_hwnd);
     }
+
     g_windowMode = mode;
     g_settings.windowMode = mode;
-    SaveSettings();
     g_isChangingWindowMode = false;
+    UpdateOverlayVisibility(true);
+    SaveSettings();
+    InvalidateVideoSurface(g_hwnd);
+}
+
+void ApplyLoadedWindowPreferences() {
+    if (!g_hwnd) return;
+    if (g_settings.windowMode != 0) {
+        g_preserveRestoreRect = true;
+        SetWindowMode(g_settings.windowMode);
+        g_preserveRestoreRect = false;
+        return;
+    }
+
+    g_isChangingWindowMode = true;
+    LONG_PTR style = GetWindowLongPtrW(g_hwnd, GWL_STYLE);
+    style &= ~static_cast<LONG_PTR>(WS_POPUP);
+    style |= WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+    SetWindowLongPtrW(g_hwnd, GWL_STYLE, style);
+    if (g_appMenu) SetMenu(g_hwnd, g_appMenu);
+    SetWindowPos(g_hwnd, nullptr, g_restoreRect.left, g_restoreRect.top,
+        g_restoreRect.right - g_restoreRect.left, g_restoreRect.bottom - g_restoreRect.top,
+        SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    g_windowMode = 0;
+    g_settings.windowMode = 0;
+    g_isChangingWindowMode = false;
+    ShowWindow(g_hwnd, g_windowMaximized ? SW_MAXIMIZE : SW_RESTORE);
+    DrawMenuBar(g_hwnd);
+    UpdateOverlayVisibility(true);
+    InvalidateVideoSurface(g_hwnd);
 }
 
 void CreateAppMenu(HWND hwnd) {
-    HMENU oldMenu = GetMenu(hwnd);
     HMENU menu = CreateMenu();
     HMENU file = CreatePopupMenu();
     HMENU view = CreatePopupMenu();
@@ -1221,9 +1455,16 @@ void CreateAppMenu(HWND hwnd) {
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"Ver");
     RebuildProfilesMenu(menu);
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(help), L"Ayuda");
-    SetMenu(hwnd, menu);
+
+    HMENU oldMenu = g_appMenu;
+    g_appMenu = menu;
+    SetMenu(hwnd, g_windowMode == 0 ? g_appMenu : nullptr);
     DrawMenuBar(hwnd);
     if (oldMenu) DestroyMenu(oldMenu);
+}
+
+void RequestMenuRebuild() {
+    if (g_hwnd && IsWindow(g_hwnd)) PostMessageW(g_hwnd, WM_APP_REBUILD_MENU, 0, 0);
 }
 
 void LayoutControls(int width, int /*height*/) {
@@ -1231,33 +1472,112 @@ void LayoutControls(int width, int /*height*/) {
     const int row1 = 8;
     const int labelW = 75;
     const int comboH = 28;
-    MoveWindow(g_videoCombo ? GetDlgItem(g_hwnd, IDC_VIDEO_LABEL) : nullptr, margin, row1 + 4, labelW, 22, TRUE);
-    if (g_videoCombo) MoveWindow(g_videoCombo, 82, row1, std::max(180, width / 3), comboH, TRUE);
-    const int audioLabelX = 82 + std::max(180, width / 3) + 12;
-    MoveWindow(GetDlgItem(g_hwnd, IDC_AUDIO_LABEL), audioLabelX, row1 + 4, 48, 22, TRUE);
+    struct Placement { HWND window; int x; int y; int width; int height; };
+    std::vector<Placement> placements;
+    placements.reserve(14);
+    auto add = [&](HWND window, int x, int y, int w, int h) {
+        if (window) placements.push_back({ window, x, y, w, h });
+    };
+
+    const int videoComboW = std::max(180, width / 3);
+    const int audioLabelX = 82 + videoComboW + 12;
     const int audioComboX = audioLabelX + 48;
     const int audioComboW = std::max(150, width - audioComboX - 315);
-    if (g_audioCombo) MoveWindow(g_audioCombo, audioComboX, row1, audioComboW, comboH, TRUE);
     const int resLabelX = audioComboX + audioComboW + 10;
-    MoveWindow(GetDlgItem(g_hwnd, IDC_RES_LABEL), resLabelX, row1 + 4, 75, 22, TRUE);
-    if (g_resolutionCombo) MoveWindow(g_resolutionCombo, resLabelX + 76, row1, 100, comboH, TRUE);
-    if (GetDlgItem(g_hwnd, IDC_RELOAD)) MoveWindow(GetDlgItem(g_hwnd, IDC_RELOAD), width - 108, row1, 96, 28, TRUE);
 
-    MoveWindow(GetDlgItem(g_hwnd, IDC_VOLUME_LABEL), margin, 52, 90, 24, TRUE);
-    if (g_volumeSlider) MoveWindow(g_volumeSlider, 104, 48, 154, 32, TRUE);
-    if (g_muteButton) MoveWindow(g_muteButton, 270, 49, 82, 28, TRUE);
-    if (GetDlgItem(g_hwnd, IDC_SYNC)) MoveWindow(GetDlgItem(g_hwnd, IDC_SYNC), 360, 49, 120, 28, TRUE);
-    if (GetDlgItem(g_hwnd, IDC_PIP)) MoveWindow(GetDlgItem(g_hwnd, IDC_PIP), 488, 49, 82, 28, TRUE);
-    if (g_status) MoveWindow(g_status, 580, 50, std::max(120, width - 595), 26, TRUE);
-    InvalidateRect(g_hwnd, nullptr, FALSE);
+    add(g_toolbarBackground, 0, 0, width, 94);
+    add(GetDlgItem(g_hwnd, IDC_VIDEO_LABEL), margin, row1 + 4, labelW, 22);
+    add(g_videoCombo, 82, row1, videoComboW, comboH);
+    add(GetDlgItem(g_hwnd, IDC_AUDIO_LABEL), audioLabelX, row1 + 4, 48, 22);
+    add(g_audioCombo, audioComboX, row1, audioComboW, comboH);
+    add(GetDlgItem(g_hwnd, IDC_RES_LABEL), resLabelX, row1 + 4, 75, 22);
+    add(g_resolutionCombo, resLabelX + 76, row1, 100, comboH);
+    add(GetDlgItem(g_hwnd, IDC_RELOAD), width - 108, row1, 96, 28);
+    add(GetDlgItem(g_hwnd, IDC_VOLUME_LABEL), margin, 52, 112, 24);
+    add(g_volumeSlider, 128, 48, 154, 32);
+    add(g_muteButton, 292, 49, 82, 28);
+    add(GetDlgItem(g_hwnd, IDC_SYNC), 382, 49, 120, 28);
+    add(GetDlgItem(g_hwnd, IDC_PIP), 510, 49, 82, 28);
+    add(g_status, 600, 50, std::max(120, width - 615), 26);
+
+    // Batch child-window positioning and suppress intermediate redraws. Moving
+    // each control with repaint enabled caused visible tearing during resize
+    // and when switching between windowed/fullscreen modes.
+    HDWP batch = BeginDeferWindowPos(static_cast<int>(placements.size()));
+    bool positioned = batch != nullptr;
+    if (positioned) {
+        for (const auto& item : placements) {
+            HDWP next = DeferWindowPos(batch, item.window, nullptr,
+                item.x, item.y, item.width, item.height,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+            if (!next) { positioned = false; break; }
+            batch = next;
+        }
+        if (positioned) positioned = EndDeferWindowPos(batch) != FALSE;
+    }
+    if (!positioned) {
+        for (const auto& item : placements)
+            MoveWindow(item.window, item.x, item.y, item.width, item.height, FALSE);
+    }
+
+    if (g_toolbarBackground) {
+        SetWindowPos(g_toolbarBackground, HWND_BOTTOM, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);
+    }
+
+    // Queue one no-erase repaint per child after all positions have settled.
+    for (const auto& item : placements) {
+        if (IsWindowVisible(item.window))
+            RedrawWindow(item.window, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE);
+    }
+    InvalidateVideoSurface(g_hwnd);
 }
 
-void DrawPreview(HDC dc, const RECT& client, bool compact = false) {
-    RECT area = compact ? client : RECT{ 0, 94, client.right, std::max(95L, client.bottom - 38) };
-    HBRUSH black = CreateSolidBrush(RGB(7, 10, 16));
-    FillRect(dc, &area, black);
-    DeleteObject(black);
+void DestroyPaintBuffer(PaintBuffer& buffer) {
+    if (buffer.dc && buffer.previousBitmap) SelectObject(buffer.dc, buffer.previousBitmap);
+    if (buffer.bitmap) DeleteObject(buffer.bitmap);
+    if (buffer.dc) DeleteDC(buffer.dc);
+    if (buffer.backgroundBrush) DeleteObject(buffer.backgroundBrush);
+    buffer = {};
+}
 
+bool EnsurePaintBuffer(HDC reference, PaintBuffer& buffer, int width, int height) {
+    if (width <= 0 || height <= 0) return false;
+    if (!buffer.dc) buffer.dc = CreateCompatibleDC(reference);
+    if (!buffer.dc) return false;
+    if (buffer.bitmap && buffer.width == width && buffer.height == height)
+        return buffer.backgroundBrush != nullptr;
+
+    if (buffer.bitmap) {
+        if (buffer.previousBitmap) SelectObject(buffer.dc, buffer.previousBitmap);
+        DeleteObject(buffer.bitmap);
+        buffer.bitmap = nullptr;
+        buffer.previousBitmap = nullptr;
+    }
+    buffer.bitmap = CreateCompatibleBitmap(reference, width, height);
+    if (!buffer.bitmap) return false;
+    buffer.previousBitmap = SelectObject(buffer.dc, buffer.bitmap);
+    if (!buffer.previousBitmap || buffer.previousBitmap == HGDI_ERROR) {
+        DeleteObject(buffer.bitmap);
+        buffer.bitmap = nullptr;
+        buffer.previousBitmap = nullptr;
+        return false;
+    }
+    if (!buffer.backgroundBrush) buffer.backgroundBrush = CreateSolidBrush(RGB(7, 10, 16));
+    buffer.width = width;
+    buffer.height = height;
+    return buffer.backgroundBrush != nullptr;
+}
+
+void DrawPreview(HDC target, HWND window, PaintBuffer& buffer, bool compact = false) {
+    RECT client{};
+    GetClientRect(window, &client);
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    if (!EnsurePaintBuffer(target, buffer, width, height)) return;
+
+    FillRect(buffer.dc, &client, buffer.backgroundBrush);
+    RECT area = compact ? client : RECT{ 0, (g_windowMode == 0 ? 94L : 0L), client.right, client.bottom };
     bool hasFrame = false;
     {
         std::lock_guard<std::mutex> lock(g_frameMutex);
@@ -1265,42 +1585,107 @@ void DrawPreview(HDC dc, const RECT& client, bool compact = false) {
             hasFrame = true;
             const int viewWidth = area.right - area.left;
             const int viewHeight = area.bottom - area.top;
-            const double scale = std::min(static_cast<double>(viewWidth) / g_latestFrame.width,
-                                          static_cast<double>(viewHeight) / g_latestFrame.height);
-            const int drawWidth = std::max(1, static_cast<int>(g_latestFrame.width * scale));
-            const int drawHeight = std::max(1, static_cast<int>(g_latestFrame.height * scale));
-            const int x = area.left + (viewWidth - drawWidth) / 2;
-            const int y = area.top + (viewHeight - drawHeight) / 2;
-            BITMAPINFO bitmapInfo{};
-            bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-            bitmapInfo.bmiHeader.biWidth = g_latestFrame.width;
-            bitmapInfo.bmiHeader.biHeight = -g_latestFrame.height;
-            bitmapInfo.bmiHeader.biPlanes = 1;
-            bitmapInfo.bmiHeader.biBitCount = 32;
-            bitmapInfo.bmiHeader.biCompression = BI_RGB;
-            SetStretchBltMode(dc, COLORONCOLOR);
-            StretchDIBits(dc, x, y, drawWidth, drawHeight, 0, 0, g_latestFrame.width, g_latestFrame.height,
-                g_latestFrame.pixels.data(), &bitmapInfo, DIB_RGB_COLORS, SRCCOPY);
+            if (viewWidth > 0 && viewHeight > 0) {
+                const double scale = std::min(static_cast<double>(viewWidth) / g_latestFrame.width,
+                                              static_cast<double>(viewHeight) / g_latestFrame.height);
+                const int drawWidth = std::max(1, static_cast<int>(g_latestFrame.width * scale));
+                const int drawHeight = std::max(1, static_cast<int>(g_latestFrame.height * scale));
+                const int x = area.left + (viewWidth - drawWidth) / 2;
+                const int y = area.top + (viewHeight - drawHeight) / 2;
+                BITMAPINFO bitmapInfo{};
+                bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bitmapInfo.bmiHeader.biWidth = g_latestFrame.width;
+                bitmapInfo.bmiHeader.biHeight = -g_latestFrame.height;
+                bitmapInfo.bmiHeader.biPlanes = 1;
+                bitmapInfo.bmiHeader.biBitCount = 32;
+                bitmapInfo.bmiHeader.biCompression = BI_RGB;
+                SetStretchBltMode(buffer.dc, COLORONCOLOR);
+                StretchDIBits(buffer.dc, x, y, drawWidth, drawHeight, 0, 0,
+                    g_latestFrame.width, g_latestFrame.height, g_latestFrame.pixels.data(),
+                    &bitmapInfo, DIB_RGB_COLORS, SRCCOPY);
+            }
         }
     }
     if (!hasFrame) {
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(190, 205, 220));
-        HFONT oldFont = static_cast<HFONT>(SelectObject(dc, g_uiFont));
+        SetBkMode(buffer.dc, TRANSPARENT);
+        SetTextColor(buffer.dc, RGB(190, 205, 220));
+        HFONT oldFont = static_cast<HFONT>(SelectObject(buffer.dc, g_uiFont));
         RECT textRect = area;
-        DrawTextW(dc, g_videoStatus.c_str(), -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        SelectObject(dc, oldFont);
+        DrawTextW(buffer.dc, g_videoStatus.c_str(), -1, &textRect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (oldFont) SelectObject(buffer.dc, oldFont);
     }
+
+    // Present the completed frame in one operation to prevent visible clears
+    // and partial GDI redraws in the main preview and the PiP window.
+    BitBlt(target, 0, 0, width, height, buffer.dc, 0, 0, SRCCOPY);
+}
+
+void InvalidateVideoSurface(HWND target) {
+    if (!target || !IsWindow(target)) return;
+    RECT area{};
+    GetClientRect(target, &area);
+    if (target == g_hwnd && g_windowMode == 0) area.top = 94;
+    if (area.top < area.bottom) InvalidateRect(target, &area, FALSE);
+}
+
+void ShowToolbarControls(bool visible) {
+    if (!g_hwnd) return;
+    if (g_toolbarBackground) ShowWindow(g_toolbarBackground, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+    const int ids[] = {
+        IDC_VIDEO_LABEL, IDC_VIDEO_DEVICE, IDC_AUDIO_LABEL, IDC_AUDIO_DEVICE,
+        IDC_RES_LABEL, IDC_RESOLUTION, IDC_RELOAD, IDC_VOLUME_LABEL, IDC_VOLUME,
+        IDC_MUTE, IDC_SYNC, IDC_PIP, IDC_STATUS
+    };
+    for (int id : ids) {
+        HWND control = GetDlgItem(g_hwnd, id);
+        if (control) ShowWindow(control, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+    }
+    g_overlayVisible = visible;
+    InvalidateVideoSurface(g_hwnd);
+}
+
+void UpdateOverlayVisibility(bool force) {
+    if (!g_hwnd) return;
+    if (g_windowMode == 0) {
+        KillTimer(g_hwnd, TIMER_OVERLAY);
+        if (g_appMenu && GetMenu(g_hwnd) != g_appMenu) {
+            SetMenu(g_hwnd, g_appMenu);
+            DrawMenuBar(g_hwnd);
+        }
+        if (force || !g_overlayVisible) ShowToolbarControls(true);
+        return;
+    }
+
+    if (GetMenu(g_hwnd)) {
+        SetMenu(g_hwnd, nullptr);
+        DrawMenuBar(g_hwnd);
+    }
+    SetTimer(g_hwnd, TIMER_OVERLAY, 90, nullptr);
+    POINT cursor{};
+    bool inTopZone = false;
+    if (GetCursorPos(&cursor)) {
+        ScreenToClient(g_hwnd, &cursor);
+        RECT client{};
+        GetClientRect(g_hwnd, &client);
+        inTopZone = cursor.x >= 0 && cursor.x < client.right && cursor.y >= 0 && cursor.y <= 108;
+    }
+    if (force || inTopZone != g_overlayVisible) ShowToolbarControls(inTopZone);
 }
 
 LRESULT CALLBACK PipWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+    case WM_NCCALCSIZE:
+        // Extend the client area over the complete window. WS_THICKFRAME is
+        // retained only for invisible resize hit zones.
+        return 0;
+    case WM_NCPAINT:
+    case WM_NCACTIVATE:
+        return TRUE;
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
-        RECT client{};
-        GetClientRect(hwnd, &client);
-        DrawPreview(dc, client, true);
+        DrawPreview(dc, hwnd, g_pipPaintBuffer, true);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -1310,9 +1695,24 @@ LRESULT CALLBACK PipWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     case WM_NCHITTEST: {
-        const LRESULT hit = DefWindowProcW(hwnd, message, wParam, lParam);
-        if (hit == HTCLIENT) return HTCAPTION;
-        return hit;
+        POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ScreenToClient(hwnd, &point);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        constexpr int grip = 9;
+        const bool left = point.x < grip;
+        const bool right = point.x >= client.right - grip;
+        const bool top = point.y < grip;
+        const bool bottom = point.y >= client.bottom - grip;
+        if (top && left) return HTTOPLEFT;
+        if (top && right) return HTTOPRIGHT;
+        if (bottom && left) return HTBOTTOMLEFT;
+        if (bottom && right) return HTBOTTOMRIGHT;
+        if (left) return HTLEFT;
+        if (right) return HTRIGHT;
+        if (top) return HTTOP;
+        if (bottom) return HTBOTTOM;
+        return HTCAPTION;
     }
     case WM_NCLBUTTONDBLCLK:
         if (g_hwnd) ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
@@ -1338,6 +1738,7 @@ LRESULT CALLBACK PipWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
         ShowWindow(hwnd, SW_HIDE);
         return 0;
     case WM_DESTROY:
+        DestroyPaintBuffer(g_pipPaintBuffer);
         if (g_pipHwnd == hwnd) g_pipHwnd = nullptr;
         return 0;
     }
@@ -1371,7 +1772,7 @@ void TogglePipTopmost() {
     g_pipAlwaysOnTop = !g_pipAlwaysOnTop;
     if (g_pipHwnd) SetWindowPos(g_pipHwnd, g_pipAlwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
         0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    CreateAppMenu(g_hwnd);
+    RequestMenuRebuild();
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -1380,6 +1781,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         g_hwnd = hwnd;
         g_uiFont = CreateFontW(-17, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        g_toolbarBackground = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_BLACKRECT,
+            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TOOLBAR_BACKGROUND)),
+            GetModuleHandleW(nullptr), nullptr);
         AddControl(0, L"STATIC", L"Capturadora", SS_LEFT, 0, 0, 0, 0, IDC_VIDEO_LABEL);
         g_videoCombo = AddControl(0, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 0, 0, 0, IDC_VIDEO_DEVICE);
         AddControl(0, L"STATIC", L"Audio", SS_LEFT, 0, 0, 0, 0, IDC_AUDIO_LABEL);
@@ -1392,6 +1796,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         AddControl(0, L"BUTTON", L"PiP", BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 0, 0, IDC_PIP);
         AddControl(0, L"STATIC", L"Volumen", SS_LEFT, 0, 0, 0, 0, IDC_VOLUME_LABEL);
         g_volumeSlider = AddControl(0, TRACKBAR_CLASSW, L"", TBS_HORZ | WS_TABSTOP, 0, 0, 0, 0, IDC_VOLUME);
+        if (g_volumeSlider) SetWindowSubclass(g_volumeSlider, VolumeSliderSubclass, 1, 0);
+        g_volumeTooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT, CW_USEDEFAULT,
+            CW_USEDEFAULT, CW_USEDEFAULT, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (g_volumeTooltip && g_volumeSlider) {
+            TOOLINFOW tool{};
+            tool.cbSize = sizeof(tool);
+            tool.uFlags = TTF_IDISHWND | TTF_TRACK | TTF_ABSOLUTE;
+            tool.hwnd = hwnd;
+            tool.uId = reinterpret_cast<UINT_PTR>(g_volumeSlider);
+            tool.lpszText = const_cast<LPWSTR>(L"0%");
+            SendMessageW(g_volumeTooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+        }
         SendMessageW(g_volumeSlider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
         SendMessageW(g_volumeSlider, TBM_SETPOS, TRUE, g_settings.volume);
         SetWindowTextW(GetDlgItem(hwnd, IDC_VOLUME_LABEL), (L"Volumen: " + std::to_wstring(g_settings.volume) + L"%").c_str());
@@ -1404,7 +1821,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         return 0;
     }
     case WM_SIZE:
+        if (!g_isChangingWindowMode && g_windowMode == 0) {
+            if (wParam == SIZE_MAXIMIZED) g_windowMaximized = true;
+            else if (wParam == SIZE_RESTORED && !IsIconic(hwnd))
+                g_windowMaximized = IsZoomed(hwnd) != FALSE;
+        }
         LayoutControls(LOWORD(lParam), HIWORD(lParam));
+        return 0;
+    case WM_EXITSIZEMOVE:
+        CaptureNormalWindowPlacement();
+        SaveSettings();
         return 0;
     case WM_GETMINMAXINFO: {
         auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
@@ -1416,6 +1842,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         const UINT commandId = LOWORD(wParam);
         if (commandId == IDM_PROFILE_SAVE) { SaveCurrentAsProfile(); return 0; }
         if (commandId == IDM_PROFILE_DEFAULT) {
+            if (g_windowMode != 0) SetWindowMode(0);
             SaveSettings();
             g_videoCapture.Stop();
             g_audioCapture.Stop();
@@ -1423,14 +1850,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             g_activeProfileName.clear();
             LoadSettings();
             ApplyPipZOrder();
-            CreateAppMenu(g_hwnd);
-            g_windowMode = 0;
+            RequestMenuRebuild();
+            ApplyLoadedWindowPreferences();
             SetWindowTextW(g_hwnd, L"PlayView");
             SendMessageW(g_volumeSlider, TBM_SETPOS, TRUE, g_settings.volume);
             SetWindowTextW(GetDlgItem(g_hwnd, IDC_VOLUME_LABEL), (L"Volumen: " + std::to_wstring(g_settings.volume) + L"%").c_str());
             SetWindowTextW(g_muteButton, g_settings.muted ? L"Activar" : L"Silenciar");
             RefreshDevices(true);
-            if (g_settings.windowMode != 0) SetWindowMode(g_settings.windowMode);
             return 0;
         }
         if (commandId >= IDM_PROFILE_LOAD_BASE && commandId < IDM_PROFILE_LOAD_BASE + ID_PROFILE_MENU_LIMIT) {
@@ -1490,9 +1916,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case IDM_VIEW_WINDOW: SetWindowMode(0); return 0;
         case IDM_VIEW_BORDERLESS: SetWindowMode(1); return 0;
         case IDM_VIEW_FULLSCREEN: SetWindowMode(g_windowMode == 2 ? 0 : 2); return 0;
-        case IDM_EXIT: DestroyWindow(hwnd); return 0;
+        case IDM_EXIT: PostMessageW(hwnd, WM_CLOSE, 0, 0); return 0;
         case IDM_ABOUT:
-            MessageBoxW(hwnd, L"PlayView 0.2.1\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation.",
+            MessageBoxW(hwnd, L"PlayView 0.2.2\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation.",
                 L"Acerca de PlayView", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
@@ -1503,6 +1929,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             g_settings.volume = static_cast<int>(SendMessageW(g_volumeSlider, TBM_GETPOS, 0, 0));
             g_volume.store(g_settings.volume);
             SetWindowTextW(GetDlgItem(hwnd, IDC_VOLUME_LABEL), (L"Volumen: " + std::to_wstring(g_settings.volume) + L"%").c_str());
+            if (g_volumeTooltipVisible) UpdateVolumeTooltip();
             SaveSettings();
         }
         return 0;
@@ -1518,8 +1945,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         break;
     case WM_APP_FRAME:
         g_frameMessagePending.store(false);
-        InvalidateRect(hwnd, nullptr, FALSE);
-        if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) InvalidateRect(g_pipHwnd, nullptr, FALSE);
+        InvalidateVideoSurface(hwnd);
+        if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) InvalidateVideoSurface(g_pipHwnd);
+        return 0;
+    case WM_APP_REBUILD_MENU:
+        CreateAppMenu(hwnd);
         return 0;
     case WM_APP_VIDEO_READY:
         g_videoStatus = L"Captura activa";
@@ -1529,8 +1959,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         g_videoStatus = L"Se perdió la señal o la capturadora se desconectó. Buscando el mismo dispositivo...";
         g_videoHasFrame.store(false);
         g_nextVideoRetry = GetTickCount64() + 2500;
+        {
+            std::lock_guard<std::mutex> lock(g_frameMutex);
+            g_latestFrame = {};
+        }
         UpdateStatusText();
-        InvalidateRect(hwnd, nullptr, FALSE);
+        InvalidateVideoSurface(hwnd);
+        if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) InvalidateVideoSurface(g_pipHwnd);
         return 0;
     case WM_APP_AUDIO_LOST:
         g_audioStatus = L"Audio desconectado. Buscando el mismo dispositivo...";
@@ -1538,6 +1973,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         UpdateStatusText();
         return 0;
     case WM_TIMER:
+        if (wParam == TIMER_OVERLAY) {
+            UpdateOverlayVisibility(false);
+            return 0;
+        }
         if (wParam == TIMER_RECONNECT) {
             const ULONGLONG now = GetTickCount64();
             const bool waitingForFirstFrame = g_videoCapture.IsRunning() && !g_videoHasFrame.load() &&
@@ -1550,7 +1989,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                     ? L"Esperando fotogramas. Comprueba la entrada HDMI de la capturadora."
                     : L"La capturadora dejó de enviar fotogramas. Pulsa F5 para recargar.";
                 UpdateStatusText();
-                InvalidateRect(hwnd, nullptr, FALSE);
+                InvalidateVideoSurface(hwnd);
             }
             if (!g_settings.videoId.empty() && !g_videoCapture.IsRunning() && now >= g_nextVideoRetry) {
                 g_videoDevices = EnumerateDevices(true);
@@ -1583,14 +2022,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
-        RECT client{};
-        GetClientRect(hwnd, &client);
-        DrawPreview(dc, client);
+        DrawPreview(dc, hwnd, g_mainPaintBuffer, false);
         EndPaint(hwnd, &ps);
         return 0;
     }
     case WM_ERASEBKGND:
         return 1;
+    case WM_CONTEXTMENU: {
+        if (g_windowMode == 0) break;
+        POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        if (lParam == -1) GetCursorPos(&point);
+        HMENU context = CreatePopupMenu();
+        AppendMenuW(context, MF_STRING, IDM_VIEW_WINDOW, L"Volver a ventana");
+        AppendMenuW(context, MF_STRING, IDM_VIEW_BORDERLESS, L"Ventana sin bordes");
+        AppendMenuW(context, MF_STRING, IDM_VIEW_FULLSCREEN, L"Pantalla completa");
+        AppendMenuW(context, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(context, MF_STRING, IDM_VIEW_PIP, L"Picture in Picture");
+        AppendMenuW(context, MF_STRING, IDM_EXIT, L"Salir");
+        TrackPopupMenu(context, TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, nullptr);
+        DestroyMenu(context);
+        return 0;
+    }
     case WM_CLOSE:
         KillTimer(hwnd, TIMER_RECONNECT);
         if (g_pipHwnd) DestroyWindow(g_pipHwnd);
@@ -1600,6 +2052,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        SaveSettings();
+        KillTimer(hwnd, TIMER_OVERLAY);
+        KillTimer(hwnd, TIMER_RECONNECT);
+        if (g_pipHwnd && IsWindow(g_pipHwnd)) DestroyWindow(g_pipHwnd);
+        g_videoCapture.Stop();
+        g_audioCapture.Stop();
+        DestroyPaintBuffer(g_mainPaintBuffer);
+        HideVolumeTooltip();
+        if (g_volumeTooltip) { DestroyWindow(g_volumeTooltip); g_volumeTooltip = nullptr; }
+        if (g_appMenu) { DestroyMenu(g_appMenu); g_appMenu = nullptr; }
         if (g_uiFont) { DeleteObject(g_uiFont); g_uiFont = nullptr; }
         PostQuitMessage(0);
         return 0;
@@ -1641,12 +2103,12 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         return 1;
     }
 
-    INITCOMMONCONTROLSEX controls{ sizeof(controls), ICC_BAR_CLASSES };
+    INITCOMMONCONTROLSEX controls{ sizeof(controls), ICC_BAR_CLASSES | ICC_WIN95_CLASSES };
     InitCommonControlsEx(&controls);
 
     WNDCLASSEXW pipClass{};
     pipClass.cbSize = sizeof(pipClass);
-    pipClass.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    pipClass.style = CS_DBLCLKS;
     pipClass.lpfnWndProc = PipWindowProc;
     pipClass.hInstance = instance;
     pipClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP_ICON));
@@ -1657,7 +2119,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.style = 0;
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = instance;
     wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP_ICON));
@@ -1671,7 +2133,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         return 1;
     }
 
-    HWND hwnd = CreateWindowExW(0, kWindowClass, kAppName, WS_OVERLAPPEDWINDOW,
+    HWND hwnd = CreateWindowExW(0, kWindowClass, kAppName,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 1180, 760, nullptr, nullptr, instance, nullptr);
     if (!hwnd) {
         MFShutdown();
@@ -1680,9 +2143,33 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     }
     g_windowMode = 0;
     if (!g_activeProfileName.empty()) SetWindowTextW(hwnd, (L"PlayView | " + g_activeProfileName).c_str());
-    ShowWindow(hwnd, showCommand);
+
+    // WM_SIZE can run during CreateWindowEx before saved placement is applied.
+    // Restore the persisted flag here so that the initial size notifications
+    // cannot overwrite the user's last maximized state.
+    g_windowMaximized = g_settings.windowMaximized;
+    if (!MonitorFromRect(&g_restoreRect, MONITOR_DEFAULTTONULL)) {
+        g_restoreRect = { 100, 100, 1280, 860 };
+        g_windowMaximized = false;
+    }
+    WINDOWPLACEMENT startupPlacement{};
+    startupPlacement.length = sizeof(startupPlacement);
+    startupPlacement.showCmd = (g_settings.windowMode == 0 && g_windowMaximized)
+        ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+    startupPlacement.rcNormalPosition = g_restoreRect;
+    SetWindowPlacement(hwnd, &startupPlacement);
+    const int startupShow = (g_settings.windowMode == 0 && g_windowMaximized)
+        ? SW_SHOWMAXIMIZED
+        : (showCommand == SW_SHOWMINIMIZED ? SW_SHOWMINNOACTIVE : SW_SHOWNORMAL);
+    ShowWindow(hwnd, startupShow);
     UpdateWindow(hwnd);
-    if (g_settings.windowMode != 0) SetWindowMode(g_settings.windowMode);
+    if (g_settings.windowMode != 0) {
+        g_preserveRestoreRect = true;
+        SetWindowMode(g_settings.windowMode);
+        g_preserveRestoreRect = false;
+    } else {
+        UpdateOverlayVisibility(true);
+    }
 
     ACCEL acceleratorEntries[] = {
         { FVIRTKEY | FNOINVERT, VK_F5, IDC_RELOAD },

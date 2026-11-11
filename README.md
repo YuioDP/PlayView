@@ -2,7 +2,7 @@
 
 **PlayView** es un monitor ligero de capturadoras para Windows. Está diseñado para mostrar la señal de una consola en una ventana sencilla, sin las funciones generales de un reproductor multimedia.
 
-> Versión de desarrollo: **0.2.1**. El proyecto incorpora captura de video y audio mediante interfaces nativas de Windows, ventana Picture in Picture y perfiles independientes. Antes de considerarlo estable debe compilarse en Windows y probarse con el modelo concreto de capturadora.
+> Versión de desarrollo: **0.2.2**. El proyecto incorpora captura de video y audio mediante interfaces nativas de Windows, ventana Picture in Picture y perfiles independientes. Esta versión corrige el repintado con doble búfer, el comportamiento de la barra superpuesta y la persistencia del tamaño maximizado. Aun debe compilarse en Windows y probarse con el modelo concreto de capturadora.
 
 ## Funciones
 
@@ -14,8 +14,11 @@
 - Reconexión automática limitada al identificador del dispositivo seleccionado.
 - Selección de las resoluciones que declara el controlador, además del modo automático.
 - Conservación de la proporción de imagen, sin estirar ni deformar el contenido.
-- Control de volumen y silencio para el audio capturado.
+- Control de volumen y silencio para el audio capturado. El porcentaje se muestra junto al deslizador y en su ayuda emergente al pasar el cursor.
 - Modos ventana, ventana sin bordes y pantalla completa.
+- Recuerdo del tamaño, posición y estado maximizado de la ventana normal, independientemente del modo de pantalla completa.
+- En ventana sin bordes y pantalla completa, la imagen ocupa todo el cliente. Los controles se ocultan y aparecen como una superposición cuando el cursor se acerca al borde superior; no desplazan ni reducen el video.
+- Menú de contexto con clic derecho para cambiar de modo cuando la barra de menú está oculta.
 - Recarga y resincronización de las capturas.
 - Indicador de desconexión, ausencia de fotogramas y recuperación del dispositivo.
 
@@ -24,6 +27,7 @@
 - Ventana PiP independiente y redimensionable.
 - Posibilidad de arrastrarla por el escritorio.
 - Opción para mantenerla siempre encima de otras ventanas o desactivar esa preferencia.
+- Ventana sin barra de título ni borde visible; el redimensionamiento se realiza mediante zonas de agarre invisibles en los bordes.
 - La ventana PiP dibuja los mismos fotogramas que la ventana principal. No inicia una segunda captura.
 - El audio continúa desde el mismo proceso de captura, por lo que cambiar de ventana no reinicia ni interrumpe deliberadamente la reproducción.
 - La ventana principal puede minimizarse mientras la ventana PiP permanece visible.
@@ -71,10 +75,10 @@ El ejecutable no necesita que estas carpetas se creen manualmente. Se generan al
 ## Tecnologías
 
 - C++20 y Win32.
-- Windows Media Foundation para enumerar y capturar dispositivos.
+- Windows Media Foundation para enumerar y capturar dispositivos. La conversión a RGB32 utiliza el procesamiento avanzado del Source Reader para aprovechar los procesadores de video disponibles y resolver las conversiones de formato de captura.
 - WinMM (`waveOut`) para reproducir el audio capturado.
 - Windows Imaging Component para convertir logos personalizados a iconos de Windows.
-- GDI para la presentación inicial de los fotogramas.
+- GDI con doble búfer persistente para presentar los fotogramas sin borrar directamente la superficie visible en cada repintado.
 - CMake y MSVC (Visual Studio 2022 / Windows SDK) para compilar.
 
 No se incorporan Electron, Qt, VLC, FFmpeg ni otros paquetes pesados.
@@ -109,8 +113,8 @@ Las instrucciones de publicación por Git también están en `INSTRUCCIONES_GITH
 Para generar una GitHub Release, crea y publica una etiqueta:
 
 ```powershell
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.2.2
+git push origin v0.2.2
 ```
 
 ## Perfiles: funcionamiento
@@ -125,11 +129,23 @@ PlayView.exe --profile "%LOCALAPPDATA%\PlayView\profiles\PS5.ini"
 
 La selección de capturadora no cambia de forma automática cuando falta el dispositivo guardado. La reconexión periódica busca únicamente el identificador persistido en el perfil activo.
 
+## Cambios de la versión 0.2.2
+
+- El estado maximizado y el rectángulo normal de la ventana se guardan en el archivo de configuración y se restauran al iniciar.
+- El modo ventana completa y el modo sin bordes ocultan la barra de menú y muestran los controles como una superposición al acercar el cursor a la parte superior. El video permanece ocupando toda la superficie.
+- El repintado utiliza un búfer GDI persistente y una única operación `BitBlt` para presentar cada imagen; las invalidaciones se limitan al área de video.
+- La copia de fotogramas prefiere `IMF2DBuffer::Lock2D` y `MFCopyImage`, que respetan el pitch real informado por el controlador. El fotograma se prepara fuera del mutex de presentación y se publica mediante intercambio de búferes, reduciendo el bloqueo entre captura y dibujo.
+- El posicionamiento de los controles se agrupa con `BeginDeferWindowPos` y se repinta sin borrado intermedio, para evitar artefactos al cambiar el tamaño o el modo de ventana.
+- El estado maximizado se conserva también al minimizar y restaurar la ventana. La salida desde el menú pasa por el mismo cierre ordenado que el botón de cierre.
+- PiP conserva el estilo de redimensionamiento de Windows, pero extiende el área cliente por toda la ventana y suprime el pintado no cliente. Las zonas de agarre permiten redimensionarla sin mostrar el borde ni la línea superior.
+- Se muestra el porcentaje del volumen en la etiqueta y en el tooltip del trackbar.
+- La reconstrucción de menús se difiere hasta que termine el comando del menú, y la creación de perfiles incluye manejo de errores de archivos.
+
 ## Alcance y limitaciones conocidas
 
 Esta versión es una base de desarrollo y necesita validación con hardware real. En particular:
 
-1. **Rendimiento gráfico.** La presentación inicial convierte los fotogramas a RGB32 mediante Source Reader y GDI. La siguiente mejora prevista es Direct3D 11, seguida de mediciones de latencia y uso de CPU con la capturadora real.
+1. **Rendimiento gráfico.** La presentación convierte los fotogramas a RGB32 mediante el procesamiento avanzado del Source Reader y GDI. La siguiente mejora prevista es Direct3D 11, seguida de mediciones de latencia y uso de CPU con la capturadora real.
 2. **Audio de salida.** El audio capturado se reproduce por el dispositivo de salida predeterminado de Windows. El selector de audio elige la entrada de la capturadora; todavía no existe un selector independiente de auriculares o altavoces.
 3. **Sincronización.** El botón `Resincronizar` reinicia las capturas de audio y video. No existe todavía un ajuste manual de desfase en milisegundos.
 4. **Detección de señal HDMI.** Algunas capturadoras continúan entregando fotogramas negros cuando no reciben señal HDMI. En esos modelos el programa puede no distinguir una pantalla negra de la ausencia de señal si el controlador no informa ese estado.
@@ -154,6 +170,6 @@ Esta versión es una base de desarrollo y necesita validación con hardware real
 - Microsoft Learn, [Capture Device Attributes](https://learn.microsoft.com/en-us/windows/win32/medfound/capture-device-attributes).
 - Microsoft Learn, [Windows Imaging Component](https://learn.microsoft.com/en-us/windows/win32/wic/-wic-about-windows-imaging-codec).
 
-## Corrección de compilación 0.2.1
+## Corrección de compilación 0.2.1 (conservada en 0.2.2)
 
 Se deshabilita la inserción automática del manifiesto por parte del enlazador de MSVC (`/MANIFEST:NO`) porque el manifiesto personalizado ya se incorpora desde `resources/app.rc.in`. Esto evita el recurso `RT_MANIFEST` duplicado que provocaba `CVTRES : fatal error CVT1100`. También se explicitan las conversiones de los índices de flujo de Media Foundation para eliminar las advertencias C4245 y se elimina el nombre de un parámetro no utilizado.
