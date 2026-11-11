@@ -2,7 +2,7 @@
 
 **PlayView** es un monitor ligero de capturadoras para Windows. Está diseñado para mostrar la señal de una consola en una ventana sencilla, sin las funciones generales de un reproductor multimedia.
 
-> Versión de desarrollo: **0.2.3**. Esta versión elimina el modo ventana sin bordes, incorpora el control «Mostrar barra de opciones» en Archivo y aplica una barra superpuesta con detección segura de listas desplegables tanto en ventana como en pantalla completa. En PiP, al pasar el cursor se oscurece la imagen y aparecen acciones para volver a la ventana principal o cerrar únicamente PiP. El proyecto incorpora captura de video y audio mediante interfaces nativas de Windows, ventana Picture in Picture y perfiles independientes. Esta versión corrige el repintado con doble búfer, el comportamiento de la barra superpuesta y la persistencia del tamaño maximizado. Aun debe compilarse en Windows y probarse con el modelo concreto de capturadora.
+> Versión de desarrollo: **0.2.4**. Esta versión define «Mostrar barra de opciones» como un ajuste exclusivo del modo ventana: activado mantiene la barra fija; desactivado la oculta y solo la muestra al acercar el cursor a la zona superior. En pantalla completa la barra siempre aparece y desaparece mediante el mismo comportamiento de proximidad, sin depender del ajuste guardado para ventana. El fondo rectangular gris de la barra se elimina: las etiquetas y el estado se dibujan directamente sobre el búfer de video. En PiP, los botones de acción usan el cursor normal y el cursor de movimiento queda reservado al área arrastrable. Se conserva el sistema de captura de audio y video de la versión anterior, que ya fue probado correctamente por el usuario. Aún debe compilarse en Windows y probarse esta revisión de interfaz en el equipo.
 
 ## Funciones
 
@@ -17,7 +17,7 @@
 - Control de volumen y silencio para el audio capturado. El porcentaje se muestra junto al deslizador y en su ayuda emergente al pasar el cursor.
 - Modos ventana y pantalla completa.
 - Recuerdo del tamaño, posición y estado maximizado de la ventana normal, independientemente del modo de pantalla completa.
-- En ventana y pantalla completa, la imagen ocupa todo el área cliente. Los controles se ocultan y aparecen como una superposición cuando el cursor se acerca a la zona superior; no desplazan ni reducen el video.
+- En modo ventana, «Archivo → Mostrar barra de opciones» activado mantiene los controles fijos; desactivado los oculta y los muestra únicamente mientras el cursor está en la zona superior. En pantalla completa, los controles siempre se muestran y ocultan por proximidad del cursor, sin que les afecte el ajuste de modo ventana. En ambos casos se superponen al video y no reservan espacio ni lo desplazan.
 - Menú de contexto con clic derecho para cambiar de modo cuando la barra de menú está oculta.
 - Recarga y resincronización de las capturas.
 - Indicador de desconexión, ausencia de fotogramas y recuperación del dispositivo.
@@ -29,6 +29,7 @@
 - Opción para mantenerla siempre encima de otras ventanas o desactivar esa preferencia.
 - Ventana sin barra de título ni borde visible; el redimensionamiento se realiza mediante zonas de agarre invisibles en los bordes.
 - La ventana PiP dibuja los mismos fotogramas que la ventana principal. No inicia una segunda captura.
+- Al pasar el cursor sobre PiP, la imagen se oscurece y aparecen los controles para volver a PlayView o cerrar PiP. Los botones mantienen el cursor de flecha; el cursor de movimiento solo aparece en las zonas de arrastre.
 - El audio continúa desde el mismo proceso de captura, por lo que cambiar de ventana no reinicia ni interrumpe deliberadamente la reproducción.
 - La ventana principal puede minimizarse mientras la ventana PiP permanece visible.
 - Menú contextual con clic derecho para ocultar PiP o alternar la opción de ventana siempre visible.
@@ -113,8 +114,8 @@ Las instrucciones de publicación por Git también están en `INSTRUCCIONES_GITH
 Para generar una GitHub Release, crea y publica una etiqueta:
 
 ```powershell
-git tag v0.2.3
-git push origin v0.2.3
+git tag v0.2.4
+git push origin v0.2.4
 ```
 
 ## Perfiles: funcionamiento
@@ -129,17 +130,20 @@ PlayView.exe --profile "%LOCALAPPDATA%\PlayView\profiles\PS5.ini"
 
 La selección de capturadora no cambia de forma automática cuando falta el dispositivo guardado. La reconexión periódica busca únicamente el identificador persistido en el perfil activo.
 
-## Cambios de la versión 0.2.3
+## Cambios de la versión 0.2.4
 
-- Se elimina el modo ventana sin bordes. Solo quedan ventana normal y pantalla completa. Los perfiles que tuvieran guardado el modo sin bordes se migran a ventana normal.
-- El video ocupa toda el área cliente en ambos modos. La barra es una superposición y no desplaza ni reduce la imagen.
-- En **Archivo** se incorpora la opción marcada **Mostrar barra de opciones**. Al activarla, los controles aparecen al acercar el puntero a la zona superior y se ocultan al retirarlo. Al desactivarla, la barra permanece oculta. La preferencia se guarda en la configuración del perfil.
-- La misma lógica de aparición y ocultación se utiliza en ventana y pantalla completa.
-- La barra permanece visible mientras cualquiera de las listas desplegables de video, audio o resolución esté abierta. Esto permite desplazarse hasta las resoluciones que aparecen en las filas inferiores.
-- Al mostrar la barra se fuerza el repintado de sus controles hijos y se coloca el fondo detrás de ellos, evitando que quede visible únicamente el rectángulo gris hasta que se pase el puntero por cada control.
-- En PiP, al entrar el puntero en la ventana, el video se oscurece y aparecen dos botones centrales. El botón con el icono de ventana vuelve a PlayView y lo pone en primer plano; el botón X oculta exclusivamente PiP.
-- PiP no activa la ventana al recibir clics, por lo que cerrar la miniventana no debe traer PlayView al frente. La acción de retorno sí activa explícitamente la ventana principal.
-- Se mantiene sin cambios el flujo de captura de audio y video de la versión 0.2.2, que ya fue probado por el usuario y funciona correctamente.
+- Se mantiene únicamente el modo ventana normal y el modo pantalla completa.
+- En modo ventana, **Archivo → Mostrar barra de opciones** funciona como preferencia de visualización: marcada, la barra permanece fija; desmarcada, la barra se oculta y solo aparece mientras el cursor permanece en la zona superior.
+- En pantalla completa la preferencia anterior se ignora: los controles siempre aparecen al acercar el cursor a la zona superior y se ocultan al retirarlo.
+- La barra se mantiene visible mientras alguna lista desplegable de video, audio o resolución está abierta, para que se puedan elegir también las resoluciones de las últimas filas.
+- Se elimina el rectángulo gris que ocupaba toda la zona de controles. Las etiquetas y el estado de conexión se dibujan sobre el mismo búfer del video, con sombra para facilitar su lectura.
+- El primer selector de video se desplaza ligeramente para que la etiqueta «Capturadora» no quede cortada.
+- En PiP, los botones centrales mantienen el cursor de flecha. El cursor de movimiento se reserva a la zona arrastrable y Windows conserva sus cursores específicos en los bordes de redimensionamiento.
+- Se conserva el sistema de captura de audio y video que ya fue probado y funciona correctamente en el equipo del usuario.
+
+## Cambios de la versión 0.2.3 (revisión anterior)
+
+La primera implementación de la barra superpuesta aplicaba la misma lógica de ocultación en ventana y pantalla completa. La versión 0.2.4 corrige ese comportamiento y redefine el ajuste de Archivo para que controle exclusivamente la visibilidad fija en el modo ventana.
 
 ## Alcance y limitaciones conocidas
 
@@ -170,6 +174,6 @@ Esta versión es una base de desarrollo y necesita validación con hardware real
 - Microsoft Learn, [Capture Device Attributes](https://learn.microsoft.com/en-us/windows/win32/medfound/capture-device-attributes).
 - Microsoft Learn, [Windows Imaging Component](https://learn.microsoft.com/en-us/windows/win32/wic/-wic-about-windows-imaging-codec).
 
-## Corrección de compilación 0.2.1 (conservada en 0.2.3)
+## Corrección de compilación 0.2.1 (conservada en 0.2.4)
 
 Se deshabilita la inserción automática del manifiesto por parte del enlazador de MSVC (`/MANIFEST:NO`) porque el manifiesto personalizado ya se incorpora desde `resources/app.rc.in`. Esto evita el recurso `RT_MANIFEST` duplicado que provocaba `CVTRES : fatal error CVT1100`. También se explicitan las conversiones de los índices de flujo de Media Foundation para eliminar las advertencias C4245 y se elimina el nombre de un parámetro no utilizado.

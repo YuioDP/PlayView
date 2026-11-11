@@ -61,14 +61,8 @@ constexpr int IDC_RESOLUTION = 1003;
 constexpr int IDC_RELOAD = 1004;
 constexpr int IDC_VOLUME = 1005;
 constexpr int IDC_MUTE = 1006;
-constexpr int IDC_STATUS = 1007;
 constexpr int IDC_PIP = 1009;
 constexpr int IDC_SYNC = 1008;
-constexpr int IDC_VIDEO_LABEL = 1010;
-constexpr int IDC_AUDIO_LABEL = 1011;
-constexpr int IDC_RES_LABEL = 1012;
-constexpr int IDC_VOLUME_LABEL = 1013;
-constexpr int IDC_TOOLBAR_BACKGROUND = 1014;
 constexpr int IDM_VIEW_WINDOW = 2001;
 constexpr int IDM_VIEW_FULLSCREEN = 2003;
 constexpr int IDM_SHOW_TOOLBAR = 2006;
@@ -144,8 +138,6 @@ HWND g_volumeTooltip = nullptr;
 HWND g_muteButton = nullptr;
 std::wstring g_volumeTooltipText;
 bool g_volumeTooltipVisible = false;
-HWND g_status = nullptr;
-HWND g_toolbarBackground = nullptr;
 HFONT g_uiFont = nullptr;
 HMENU g_appMenu = nullptr;
 PaintBuffer g_mainPaintBuffer;
@@ -166,6 +158,7 @@ std::atomic<ULONGLONG> g_lastVideoFrameTick{ 0 };
 ULONGLONG g_videoStartTick = 0;
 std::wstring g_videoStatus = L"Selecciona una capturadora para comenzar.";
 std::wstring g_audioStatus = L"Audio sin configurar.";
+std::wstring g_statusText;
 ULONGLONG g_nextVideoRetry = 0;
 ULONGLONG g_nextAudioRetry = 0;
 RECT g_restoreRect{ 100, 100, 1280, 860 };
@@ -174,7 +167,6 @@ bool g_windowMaximized = false;
 bool g_isChangingWindowMode = false;
 bool g_preserveRestoreRect = false;
 bool g_overlayVisible = true;
-bool g_toolbarAutoShow = true;
 bool g_pipHover = false;
 std::filesystem::path g_appDirectory;
 std::filesystem::path g_settingsPath;
@@ -282,7 +274,6 @@ void LoadSettingsFrom(const std::filesystem::path& path) {
     // safely migrate to the regular windowed mode.
     g_settings.windowMode = (savedWindowMode == 2) ? 2 : 0;
     g_settings.showToolbar = ReadIniInt(L"Window", L"ShowToolbar", 1) != 0;
-    g_toolbarAutoShow = g_settings.showToolbar;
     g_settings.windowMaximized = ReadIniInt(L"Window", L"Maximized", 0) != 0;
     g_settings.windowX = ReadIniInt(L"Window", L"X", 100);
     g_settings.windowY = ReadIniInt(L"Window", L"Y", 100);
@@ -318,7 +309,7 @@ void SaveSettingsTo(const std::filesystem::path& path) {
     WriteIniString(L"Audio", L"Volume", std::to_wstring(g_settings.volume));
     WriteIniString(L"Audio", L"Muted", g_settings.muted ? L"1" : L"0");
     WriteIniString(L"Window", L"Mode", std::to_wstring(g_windowMode));
-    WriteIniString(L"Window", L"ShowToolbar", g_toolbarAutoShow ? L"1" : L"0");
+    WriteIniString(L"Window", L"ShowToolbar", g_settings.showToolbar ? L"1" : L"0");
     WriteIniString(L"Window", L"Maximized", g_windowMaximized ? L"1" : L"0");
     WriteIniString(L"Window", L"X", std::to_wstring(g_restoreRect.left));
     WriteIniString(L"Window", L"Y", std::to_wstring(g_restoreRect.top));
@@ -738,10 +729,11 @@ std::vector<VideoMode> EnumerateVideoModes(const std::wstring& deviceId) {
 }
 
 void UpdateStatusText() {
-    if (!g_status) return;
-    std::wstring combined = g_videoStatus;
-    if (!g_audioStatus.empty()) combined += L"    |    " + g_audioStatus;
-    SetWindowTextW(g_status, combined.c_str());
+    g_statusText = g_videoStatus;
+    if (!g_audioStatus.empty()) g_statusText += L"    |    " + g_audioStatus;
+    // Status and toolbar labels are painted into the same video back buffer.
+    // This avoids the opaque gray STATIC-control strip around the toolbar.
+    InvalidateVideoSurface(g_hwnd);
 }
 
 class VideoCapture {
@@ -1090,7 +1082,7 @@ void LoadProfile(const ProfileEntry& profile) {
     RequestMenuRebuild();
     SetWindowTextW(g_hwnd, (L"PlayView | " + g_activeProfileName).c_str());
     SendMessageW(g_volumeSlider, TBM_SETPOS, TRUE, g_settings.volume);
-    SetWindowTextW(GetDlgItem(g_hwnd, IDC_VOLUME_LABEL), (L"Volumen: " + std::to_wstring(g_settings.volume) + L"%").c_str());
+    
     SetWindowTextW(g_muteButton, g_settings.muted ? L"Activar" : L"Silenciar");
     ApplyLoadedWindowPreferences();
     RefreshDevices(true);
@@ -1449,7 +1441,7 @@ void CreateAppMenu(HWND hwnd) {
     HMENU file = CreatePopupMenu();
     HMENU view = CreatePopupMenu();
     HMENU help = CreatePopupMenu();
-    AppendMenuW(file, MF_STRING | (g_toolbarAutoShow ? MF_CHECKED : MF_UNCHECKED),
+    AppendMenuW(file, MF_STRING | (g_settings.showToolbar ? MF_CHECKED : MF_UNCHECKED),
         IDM_SHOW_TOOLBAR, L"Mostrar barra de opciones");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, IDM_EXIT, L"Salir");
@@ -1476,41 +1468,32 @@ void RequestMenuRebuild() {
 }
 
 void LayoutControls(int width, int /*height*/) {
-    const int margin = 12;
     const int row1 = 8;
-    const int labelW = 75;
     const int comboH = 28;
     struct Placement { HWND window; int x; int y; int width; int height; };
     std::vector<Placement> placements;
-    placements.reserve(14);
+    placements.reserve(9);
     auto add = [&](HWND window, int x, int y, int w, int h) {
         if (window) placements.push_back({ window, x, y, w, h });
     };
 
     const int videoComboW = std::max(180, width / 3);
-    const int audioLabelX = 82 + videoComboW + 12;
+    const int audioLabelX = 100 + videoComboW + 12;
     const int audioComboX = audioLabelX + 48;
     const int audioComboW = std::max(150, width - audioComboX - 315);
     const int resLabelX = audioComboX + audioComboW + 10;
 
-    add(g_toolbarBackground, 0, 0, width, 94);
-    add(GetDlgItem(g_hwnd, IDC_VIDEO_LABEL), margin, row1 + 4, labelW, 22);
-    add(g_videoCombo, 82, row1, videoComboW, comboH);
-    add(GetDlgItem(g_hwnd, IDC_AUDIO_LABEL), audioLabelX, row1 + 4, 48, 22);
+    add(g_videoCombo, 100, row1, videoComboW, comboH);
     add(g_audioCombo, audioComboX, row1, audioComboW, comboH);
-    add(GetDlgItem(g_hwnd, IDC_RES_LABEL), resLabelX, row1 + 4, 75, 22);
     add(g_resolutionCombo, resLabelX + 76, row1, 100, comboH);
     add(GetDlgItem(g_hwnd, IDC_RELOAD), width - 108, row1, 96, 28);
-    add(GetDlgItem(g_hwnd, IDC_VOLUME_LABEL), margin, 52, 112, 24);
     add(g_volumeSlider, 128, 48, 154, 32);
     add(g_muteButton, 292, 49, 82, 28);
     add(GetDlgItem(g_hwnd, IDC_SYNC), 382, 49, 120, 28);
     add(GetDlgItem(g_hwnd, IDC_PIP), 510, 49, 82, 28);
-    add(g_status, 600, 50, std::max(120, width - 615), 26);
 
-    // Batch child-window positioning and suppress intermediate redraws. Moving
-    // each control with repaint enabled caused visible tearing during resize
-    // and when switching between windowed/fullscreen modes.
+    // Position all interactive controls as one batch to avoid intermediate
+    // frame clears during resize and while switching display modes.
     HDWP batch = BeginDeferWindowPos(static_cast<int>(placements.size()));
     bool positioned = batch != nullptr;
     if (positioned) {
@@ -1528,12 +1511,6 @@ void LayoutControls(int width, int /*height*/) {
             MoveWindow(item.window, item.x, item.y, item.width, item.height, FALSE);
     }
 
-    if (g_toolbarBackground) {
-        SetWindowPos(g_toolbarBackground, HWND_BOTTOM, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);
-    }
-
-    // Queue one no-erase repaint per child after all positions have settled.
     for (const auto& item : placements) {
         if (IsWindowVisible(item.window))
             RedrawWindow(item.window, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE);
@@ -1643,6 +1620,42 @@ void DrawPreview(HDC target, HWND window, PaintBuffer& buffer, bool compact = fa
         if (oldFont) SelectObject(buffer.dc, oldFont);
     }
 
+    // Toolbar captions are part of the video back buffer rather than opaque
+    // STATIC child windows. The live picture therefore remains visible around
+    // the controls without the previous gray rectangular background.
+    if (!compact && g_overlayVisible) {
+        HFONT oldFont = static_cast<HFONT>(SelectObject(buffer.dc, g_uiFont));
+        const int oldBkMode = SetBkMode(buffer.dc, TRANSPARENT);
+        auto drawLabel = [&](const std::wstring& text, RECT rect) {
+            RECT shadow = rect;
+            OffsetRect(&shadow, 1, 1);
+            SetTextColor(buffer.dc, RGB(0, 0, 0));
+            DrawTextW(buffer.dc, text.c_str(), -1, &shadow,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            SetTextColor(buffer.dc, RGB(245, 248, 252));
+            DrawTextW(buffer.dc, text.c_str(), -1, &rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        };
+
+        const int width = area.right - area.left;
+        const int videoComboW = std::max(180, width / 3);
+        const int audioLabelX = 100 + videoComboW + 12;
+        const int audioComboX = audioLabelX + 48;
+        const int audioComboW = std::max(150, width - audioComboX - 315);
+        const int resLabelX = audioComboX + audioComboW + 10;
+
+        drawLabel(L"Capturadora", RECT{ 12, 8, 96, 36 });
+        drawLabel(L"Audio", RECT{ audioLabelX, 8, audioLabelX + 46, 36 });
+        drawLabel(L"Resolución", RECT{ resLabelX, 8, resLabelX + 74, 36 });
+        drawLabel(L"Volumen: " + std::to_wstring(g_settings.volume) + L"%",
+            RECT{ 12, 48, 124, 80 });
+        if (!g_statusText.empty()) {
+            drawLabel(g_statusText, RECT{ 600, 48, std::max(720, width - 12), 80 });
+        }
+        SetBkMode(buffer.dc, oldBkMode);
+        if (oldFont) SelectObject(buffer.dc, oldFont);
+    }
+
     // PiP hover controls are drawn into the same back buffer so the user sees
     // one atomic presentation rather than a video blit followed by an overlay blit.
     if (compact && g_pipHover) DrawPipHoverActions(buffer.dc, window);
@@ -1668,18 +1681,11 @@ bool IsAnyToolbarComboDropped() {
     return false;
 }
 
-bool IsToolbarControlFocused() {
-    const HWND focused = GetFocus();
-    return focused && g_hwnd && IsChild(g_hwnd, focused);
-}
-
 void ShowToolbarControls(bool visible) {
     if (!g_hwnd) return;
-    if (g_toolbarBackground) ShowWindow(g_toolbarBackground, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
     const int ids[] = {
-        IDC_VIDEO_LABEL, IDC_VIDEO_DEVICE, IDC_AUDIO_LABEL, IDC_AUDIO_DEVICE,
-        IDC_RES_LABEL, IDC_RESOLUTION, IDC_RELOAD, IDC_VOLUME_LABEL, IDC_VOLUME,
-        IDC_MUTE, IDC_SYNC, IDC_PIP, IDC_STATUS
+        IDC_VIDEO_DEVICE, IDC_AUDIO_DEVICE, IDC_RESOLUTION, IDC_RELOAD,
+        IDC_VOLUME, IDC_MUTE, IDC_SYNC, IDC_PIP
     };
     for (int id : ids) {
         HWND control = GetDlgItem(g_hwnd, id);
@@ -1688,32 +1694,13 @@ void ShowToolbarControls(bool visible) {
             SetWindowPos(control, HWND_TOP, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOREDRAW);
             ShowWindow(control, SW_SHOWNOACTIVATE);
+            RedrawWindow(control, nullptr, nullptr,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
         } else {
             ShowWindow(control, SW_HIDE);
         }
     }
     g_overlayVisible = visible;
-
-    if (visible) {
-        // Keep the background below all controls, then force a complete
-        // synchronous repaint so the controls do not remain as gray blanks
-        // until the pointer happens to pass over each individual control.
-        if (g_toolbarBackground) {
-            SetWindowPos(g_toolbarBackground, HWND_BOTTOM, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);
-        }
-        RECT toolbarRect{};
-        GetClientRect(g_hwnd, &toolbarRect);
-        toolbarRect.bottom = std::min<LONG>(toolbarRect.bottom, 100);
-        RedrawWindow(g_hwnd, &toolbarRect, nullptr,
-            RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_NOERASE);
-        for (int id : ids) {
-            HWND control = GetDlgItem(g_hwnd, id);
-            if (control && IsWindowVisible(control))
-                RedrawWindow(control, nullptr, nullptr,
-                    RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_NOERASE);
-        }
-    }
     InvalidateVideoSurface(g_hwnd);
 }
 
@@ -1725,17 +1712,18 @@ void UpdateOverlayVisibility(bool force) {
             SetMenu(g_hwnd, g_appMenu);
             DrawMenuBar(g_hwnd);
         }
-    } else {
-        if (GetMenu(g_hwnd)) {
-            SetMenu(g_hwnd, nullptr);
-            DrawMenuBar(g_hwnd);
-        }
+    } else if (GetMenu(g_hwnd)) {
+        SetMenu(g_hwnd, nullptr);
+        DrawMenuBar(g_hwnd);
     }
 
-    // A single hover policy is used in windowed and fullscreen modes.
-    if (!g_toolbarAutoShow) {
+    // The menu option controls only normal windowed mode. Checked means the
+    // toolbar stays fixed. Fullscreen always uses top-edge hover, regardless
+    // of the saved windowed-mode preference.
+    const bool useHoverReveal = (g_windowMode == 2) || !g_settings.showToolbar;
+    if (!useHoverReveal) {
         KillTimer(g_hwnd, TIMER_OVERLAY);
-        if (g_overlayVisible || force) ShowToolbarControls(false);
+        if (!g_overlayVisible || force) ShowToolbarControls(true);
         return;
     }
 
@@ -1747,19 +1735,15 @@ void UpdateOverlayVisibility(bool force) {
         if (ScreenToClient(g_hwnd, &clientCursor)) {
             RECT client{};
             GetClientRect(g_hwnd, &client);
-            // The complete 94 px toolbar remains interactive. The small
-            // tolerance below it avoids flicker when moving between controls.
             inTopZone = clientCursor.x >= 0 && clientCursor.x < client.right &&
                 clientCursor.y >= 0 && clientCursor.y <= 104;
         }
     }
 
-    // Native combo-box dropdowns are separate popup windows and may extend
-    // far below the toolbar. Keep the overlay visible until selection closes
-    // the list, otherwise lower resolutions cannot be clicked.
+    // Keep the bar open while a combo's native popup list is active, including
+    // the lower entries that extend beyond the toolbar's visible top area.
     const bool comboIsOpen = IsAnyToolbarComboDropped();
-    const bool toolbarHasFocus = IsToolbarControlFocused();
-    const bool shouldShow = inTopZone || comboIsOpen || toolbarHasFocus;
+    const bool shouldShow = inTopZone || comboIsOpen;
     if (force || shouldShow != g_overlayVisible) ShowToolbarControls(shouldShow);
 }
 
@@ -1894,6 +1878,20 @@ LRESULT CALLBACK PipWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
     case WM_MOUSEACTIVATE:
         // Clicking PiP must not steal foreground from the application behind it.
         return MA_NOACTIVATE;
+    case WM_SETCURSOR: {
+        const LRESULT hitTest = LOWORD(lParam);
+        if (hitTest == HTCLIENT) {
+            // In particular, the two hover actions always use the arrow cursor.
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            return TRUE;
+        }
+        if (hitTest == HTCAPTION) {
+            SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+            return TRUE;
+        }
+        // Let Windows select the correct resize cursor for HTLEFT/HTTOP/etc.
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
     case WM_MOUSEMOVE: {
         TRACKMOUSEEVENT tracking{ sizeof(tracking), TME_LEAVE, hwnd, 0 };
         TrackMouseEvent(&tracking);
@@ -2018,20 +2016,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         g_hwnd = hwnd;
         g_uiFont = CreateFontW(-17, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        g_toolbarBackground = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_BLACKRECT,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TOOLBAR_BACKGROUND)),
-            GetModuleHandleW(nullptr), nullptr);
-        AddControl(0, L"STATIC", L"Capturadora", SS_LEFT, 0, 0, 0, 0, IDC_VIDEO_LABEL);
         g_videoCombo = AddControl(0, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 0, 0, 0, IDC_VIDEO_DEVICE);
-        AddControl(0, L"STATIC", L"Audio", SS_LEFT, 0, 0, 0, 0, IDC_AUDIO_LABEL);
         g_audioCombo = AddControl(0, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 0, 0, 0, IDC_AUDIO_DEVICE);
         SendMessageW(g_videoCombo, CB_SETMINVISIBLE, 8, 0);
         SendMessageW(g_audioCombo, CB_SETMINVISIBLE, 8, 0);
-        AddControl(0, L"STATIC", L"Resolución", SS_LEFT, 0, 0, 0, 0, IDC_RES_LABEL);
         g_resolutionCombo = AddControl(0, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 0, 0, 0, IDC_RESOLUTION);
         AddControl(0, L"BUTTON", L"Recargar (F5)", BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 0, 0, IDC_RELOAD);
         AddControl(0, L"BUTTON", L"PiP", BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 0, 0, IDC_PIP);
-        AddControl(0, L"STATIC", L"Volumen", SS_LEFT, 0, 0, 0, 0, IDC_VOLUME_LABEL);
         g_volumeSlider = AddControl(0, TRACKBAR_CLASSW, L"", TBS_HORZ | WS_TABSTOP, 0, 0, 0, 0, IDC_VOLUME);
         if (g_volumeSlider) SetWindowSubclass(g_volumeSlider, VolumeSliderSubclass, 1, 0);
         g_volumeTooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
@@ -2048,10 +2039,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         }
         SendMessageW(g_volumeSlider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
         SendMessageW(g_volumeSlider, TBM_SETPOS, TRUE, g_settings.volume);
-        SetWindowTextW(GetDlgItem(hwnd, IDC_VOLUME_LABEL), (L"Volumen: " + std::to_wstring(g_settings.volume) + L"%").c_str());
+        
         g_muteButton = AddControl(0, L"BUTTON", g_settings.muted ? L"Activar" : L"Silenciar", BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 0, 0, IDC_MUTE);
         AddControl(0, L"BUTTON", L"Resincronizar", BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 0, 0, IDC_SYNC);
-        g_status = AddControl(0, L"STATIC", L"Iniciando PlayView...", SS_LEFT | SS_NOPREFIX, 0, 0, 0, 0, IDC_STATUS);
         CreateAppMenu(hwnd);
         RefreshDevices(true);
         SetTimer(hwnd, TIMER_RECONNECT, 2500, nullptr);
@@ -2091,8 +2081,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             ApplyLoadedWindowPreferences();
             SetWindowTextW(g_hwnd, L"PlayView");
             SendMessageW(g_volumeSlider, TBM_SETPOS, TRUE, g_settings.volume);
-            SetWindowTextW(GetDlgItem(g_hwnd, IDC_VOLUME_LABEL), (L"Volumen: " + std::to_wstring(g_settings.volume) + L"%").c_str());
             SetWindowTextW(g_muteButton, g_settings.muted ? L"Activar" : L"Silenciar");
+            InvalidateVideoSurface(hwnd);
             RefreshDevices(true);
             return 0;
         }
@@ -2151,10 +2141,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case IDM_VIEW_PIP: TogglePictureInPicture(); return 0;
         case IDM_PIP_TOPMOST: TogglePipTopmost(); return 0;
         case IDM_SHOW_TOOLBAR:
-            g_toolbarAutoShow = !g_toolbarAutoShow;
-            g_settings.showToolbar = g_toolbarAutoShow;
-            if (!g_toolbarAutoShow) ShowToolbarControls(false);
-            else UpdateOverlayVisibility(true);
+            g_settings.showToolbar = !g_settings.showToolbar;
+            UpdateOverlayVisibility(true);
             SaveSettings();
             RequestMenuRebuild();
             return 0;
@@ -2162,7 +2150,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case IDM_VIEW_FULLSCREEN: SetWindowMode(g_windowMode == 2 ? 0 : 2); return 0;
         case IDM_EXIT: PostMessageW(hwnd, WM_CLOSE, 0, 0); return 0;
         case IDM_ABOUT:
-            MessageBoxW(hwnd, L"PlayView 0.2.3\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation.",
+            MessageBoxW(hwnd, L"PlayView 0.2.4\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation.",
                 L"Acerca de PlayView", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
@@ -2172,9 +2160,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         if (reinterpret_cast<HWND>(lParam) == g_volumeSlider) {
             g_settings.volume = static_cast<int>(SendMessageW(g_volumeSlider, TBM_GETPOS, 0, 0));
             g_volume.store(g_settings.volume);
-            SetWindowTextW(GetDlgItem(hwnd, IDC_VOLUME_LABEL), (L"Volumen: " + std::to_wstring(g_settings.volume) + L"%").c_str());
             if (g_volumeTooltipVisible) UpdateVolumeTooltip();
             SaveSettings();
+            InvalidateVideoSurface(hwnd);
         }
         return 0;
     case WM_KEYDOWN:
@@ -2355,7 +2343,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     pipClass.lpfnWndProc = PipWindowProc;
     pipClass.hInstance = instance;
     pipClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP_ICON));
-    pipClass.hCursor = LoadCursorW(nullptr, IDC_SIZEALL);
+    pipClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     pipClass.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     pipClass.lpszClassName = kPipWindowClass;
     RegisterClassExW(&pipClass);
