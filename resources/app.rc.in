@@ -19,11 +19,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "PlayView Project\0"
             VALUE "FileDescription", "PlayView Capture Monitor\0"
-            VALUE "FileVersion", "0.2.5.0\0"
+            VALUE "FileVersion", "0.2.6.0\0"
             VALUE "InternalName", "PlayView\0"
             VALUE "OriginalFilename", "PlayView.exe\0"
             VALUE "ProductName", "PlayView\0"
-            VALUE "ProductVersion", "0.2.5\0"
+            VALUE "ProductVersion", "0.2.6\0"
         END
     END
     BLOCK "VarFileInfo"
