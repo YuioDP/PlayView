@@ -77,6 +77,9 @@ constexpr int IDM_PROFILE_SHORTCUT_BASE = 2300;
 constexpr int IDM_PROFILE_DELETE_BASE = 2400;
 constexpr int IDM_PROFILE_ICON_BASE = 2500;
 constexpr int IDM_PIP_CLOSE = 2600;
+constexpr int IDM_LANGUAGE_AUTOMATIC = 2700;
+constexpr int IDM_LANGUAGE_SPANISH = 2701;
+constexpr int IDM_LANGUAGE_ENGLISH = 2702;
 constexpr int ID_PROFILE_MENU_LIMIT = 100;
 
 enum class LanguagePreference : int { Automatic = 0, Spanish = 1, English = 2 };
@@ -191,7 +194,7 @@ const wchar_t* Tr(TextId id) {
     case TextId::HidePip: return en ? L"Hide Picture in Picture" : L"Ocultar imagen en imagen";
     case TextId::AlwaysOnTop: return en ? L"Always on top" : L"Siempre visible";
     case TextId::PipCreateFailed: return en ? L"Could not create the Picture in Picture window." : L"No se pudo crear la ventana de imagen en imagen.";
-    case TextId::AboutBody: return en ? L"PlayView 1.1.0\nA lightweight monitor for video capture devices.\n\nCapture powered by Windows Media Foundation." : L"PlayView 1.1.0\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation.";
+    case TextId::AboutBody: return en ? L"PlayView 1.1.1\nA lightweight monitor for video capture devices.\n\nCapture powered by Windows Media Foundation." : L"PlayView 1.1.1\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation.";
     case TextId::AboutTitle: return en ? L"About PlayView" : L"Acerca de PlayView";
     case TextId::MediaFoundationStartupError: return en ? L"Could not initialize Windows Media Foundation. Make sure Windows is up to date." : L"No se pudo iniciar Windows Media Foundation. Comprueba que Windows esté actualizado.";
     case TextId::ShowPip: return en ? L"Show Picture in Picture" : L"Mostrar imagen en imagen";
@@ -1880,11 +1883,11 @@ void DrawPreview(HDC target, HWND window, PaintBuffer& buffer, bool compact = fa
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         };
 
-        const int width = area.right - area.left;
-        const int videoComboW = std::max(180, width / 3);
+        const int clientAreaWidth = area.right - area.left;
+        const int videoComboW = std::max(180, clientAreaWidth / 3);
         const int audioLabelX = 100 + videoComboW + 12;
         const int audioComboX = audioLabelX + 48;
-        const int audioComboW = std::max(150, width - audioComboX - 315);
+        const int audioComboW = std::max(150, clientAreaWidth - audioComboX - 315);
         const int resLabelX = audioComboX + audioComboW + 10;
 
         drawLabel(Tr(TextId::CaptureDeviceLabel), RECT{ 12, 8, 96, 36 });
@@ -1893,7 +1896,7 @@ void DrawPreview(HDC target, HWND window, PaintBuffer& buffer, bool compact = fa
         drawLabel(std::wstring(Tr(TextId::VolumeLabel)) + std::to_wstring(g_settings.volume) + L"%",
             RECT{ 12, 48, 124, 80 });
         if (!g_statusText.empty()) {
-            drawLabel(g_statusText, RECT{ 600, 48, std::max(720, width - 12), 80 });
+            drawLabel(g_statusText, RECT{ 600, 48, std::max(720, clientAreaWidth - 12), 80 });
         }
         SetBkMode(buffer.dc, oldBkMode);
         if (oldFont) SelectObject(buffer.dc, oldFont);
