@@ -70,8 +70,8 @@ constexpr int IDC_RES_LABEL = 1012;
 constexpr int IDC_VOLUME_LABEL = 1013;
 constexpr int IDC_TOOLBAR_BACKGROUND = 1014;
 constexpr int IDM_VIEW_WINDOW = 2001;
-constexpr int IDM_VIEW_BORDERLESS = 2002;
 constexpr int IDM_VIEW_FULLSCREEN = 2003;
+constexpr int IDM_SHOW_TOOLBAR = 2006;
 constexpr int IDM_EXIT = 2004;
 constexpr int IDM_ABOUT = 2005;
 constexpr int IDM_VIEW_PIP = 2010;
@@ -104,7 +104,8 @@ struct Settings {
     int height = 0;
     int volume = 80;
     bool muted = false;
-    int windowMode = 0; // 0 windowed, 1 borderless, 2 fullscreen
+    int windowMode = 0; // 0 windowed, 2 fullscreen (1 was the removed borderless mode)
+    bool showToolbar = true;
     bool windowMaximized = false;
     int windowX = 100;
     int windowY = 100;
@@ -156,6 +157,7 @@ std::vector<DeviceInfo> g_audioDevices;
 std::vector<VideoMode> g_videoModes;
 std::mutex g_frameMutex;
 FrameData g_latestFrame;
+std::vector<BYTE> g_pipDimFrameScratch;
 std::atomic_bool g_frameMessagePending{ false };
 std::atomic_int g_volume{ 80 };
 std::atomic_bool g_muted{ false };
@@ -172,6 +174,8 @@ bool g_windowMaximized = false;
 bool g_isChangingWindowMode = false;
 bool g_preserveRestoreRect = false;
 bool g_overlayVisible = true;
+bool g_toolbarAutoShow = true;
+bool g_pipHover = false;
 std::filesystem::path g_appDirectory;
 std::filesystem::path g_settingsPath;
 std::filesystem::path g_logPath;
@@ -191,6 +195,7 @@ void InvalidateVideoSurface(HWND target);
 void CaptureNormalWindowPlacement();
 void RequestMenuRebuild();
 void ApplyLoadedWindowPreferences();
+void DrawPipHoverActions(HDC dc, HWND hwnd);
 
 void Log(const std::wstring& message) {
     if (g_logPath.empty()) return;
@@ -272,7 +277,12 @@ void LoadSettingsFrom(const std::filesystem::path& path) {
     g_settings.height = ReadIniInt(L"Video", L"Height", 0);
     g_settings.volume = std::clamp(ReadIniInt(L"Audio", L"Volume", 80), 0, 100);
     g_settings.muted = ReadIniInt(L"Audio", L"Muted", 0) != 0;
-    g_settings.windowMode = std::clamp(ReadIniInt(L"Window", L"Mode", 0), 0, 2);
+    const int savedWindowMode = ReadIniInt(L"Window", L"Mode", 0);
+    // Mode 1 used to mean borderless. It has been removed, so old settings
+    // safely migrate to the regular windowed mode.
+    g_settings.windowMode = (savedWindowMode == 2) ? 2 : 0;
+    g_settings.showToolbar = ReadIniInt(L"Window", L"ShowToolbar", 1) != 0;
+    g_toolbarAutoShow = g_settings.showToolbar;
     g_settings.windowMaximized = ReadIniInt(L"Window", L"Maximized", 0) != 0;
     g_settings.windowX = ReadIniInt(L"Window", L"X", 100);
     g_settings.windowY = ReadIniInt(L"Window", L"Y", 100);
@@ -308,6 +318,7 @@ void SaveSettingsTo(const std::filesystem::path& path) {
     WriteIniString(L"Audio", L"Volume", std::to_wstring(g_settings.volume));
     WriteIniString(L"Audio", L"Muted", g_settings.muted ? L"1" : L"0");
     WriteIniString(L"Window", L"Mode", std::to_wstring(g_windowMode));
+    WriteIniString(L"Window", L"ShowToolbar", g_toolbarAutoShow ? L"1" : L"0");
     WriteIniString(L"Window", L"Maximized", g_windowMaximized ? L"1" : L"0");
     WriteIniString(L"Window", L"X", std::to_wstring(g_restoreRect.left));
     WriteIniString(L"Window", L"Y", std::to_wstring(g_restoreRect.top));
@@ -1357,11 +1368,12 @@ void HandleResolutionSelection() {
 }
 
 void SetWindowMode(int mode) {
-    mode = std::clamp(mode, 0, 2);
+    // Only regular windowed mode (0) and fullscreen (2) remain supported.
+    mode = (mode == 2) ? 2 : 0;
     if (!g_hwnd || g_isChangingWindowMode || mode == g_windowMode) return;
     g_isChangingWindowMode = true;
 
-    if (g_windowMode == 0 && mode != 0 && !g_preserveRestoreRect) {
+    if (g_windowMode == 0 && mode == 2 && !g_preserveRestoreRect) {
         WINDOWPLACEMENT placement{};
         placement.length = sizeof(placement);
         if (GetWindowPlacement(g_hwnd, &placement)) {
@@ -1389,18 +1401,11 @@ void SetWindowMode(int mode) {
         style &= ~static_cast<LONG_PTR>(WS_OVERLAPPEDWINDOW);
         style |= WS_POPUP | WS_CLIPCHILDREN;
         SetWindowLongPtrW(g_hwnd, GWL_STYLE, style);
-        if (mode == 1) {
-            SetWindowPos(g_hwnd, nullptr, g_restoreRect.left, g_restoreRect.top,
-                g_restoreRect.right - g_restoreRect.left, g_restoreRect.bottom - g_restoreRect.top,
-                SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-        } else {
-            MONITORINFO monitorInfo{ sizeof(monitorInfo) };
-            GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &monitorInfo);
-            const RECT target = monitorInfo.rcMonitor;
-            SetWindowPos(g_hwnd, HWND_TOP, target.left, target.top, target.right - target.left,
-                target.bottom - target.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-        }
-        DrawMenuBar(g_hwnd);
+        MONITORINFO monitorInfo{ sizeof(monitorInfo) };
+        GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &monitorInfo);
+        const RECT target = monitorInfo.rcMonitor;
+        SetWindowPos(g_hwnd, HWND_TOP, target.left, target.top, target.right - target.left,
+            target.bottom - target.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     }
 
     g_windowMode = mode;
@@ -1417,6 +1422,7 @@ void ApplyLoadedWindowPreferences() {
         g_preserveRestoreRect = true;
         SetWindowMode(g_settings.windowMode);
         g_preserveRestoreRect = false;
+        UpdateOverlayVisibility(true);
         return;
     }
 
@@ -1443,9 +1449,11 @@ void CreateAppMenu(HWND hwnd) {
     HMENU file = CreatePopupMenu();
     HMENU view = CreatePopupMenu();
     HMENU help = CreatePopupMenu();
+    AppendMenuW(file, MF_STRING | (g_toolbarAutoShow ? MF_CHECKED : MF_UNCHECKED),
+        IDM_SHOW_TOOLBAR, L"Mostrar barra de opciones");
+    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, IDM_EXIT, L"Salir");
     AppendMenuW(view, MF_STRING, IDM_VIEW_WINDOW, L"Ventana");
-    AppendMenuW(view, MF_STRING, IDM_VIEW_BORDERLESS, L"Ventana sin bordes");
     AppendMenuW(view, MF_STRING, IDM_VIEW_FULLSCREEN, L"Pantalla completa\tF11");
     AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(view, MF_STRING, IDM_VIEW_PIP, L"Picture in Picture\tCtrl+Mayús+P");
@@ -1577,7 +1585,7 @@ void DrawPreview(HDC target, HWND window, PaintBuffer& buffer, bool compact = fa
     if (!EnsurePaintBuffer(target, buffer, width, height)) return;
 
     FillRect(buffer.dc, &client, buffer.backgroundBrush);
-    RECT area = compact ? client : RECT{ 0, (g_windowMode == 0 ? 94L : 0L), client.right, client.bottom };
+    RECT area = client; // The toolbar is layered above the video, never reserved from its area.
     bool hasFrame = false;
     {
         std::lock_guard<std::mutex> lock(g_frameMutex);
@@ -1586,6 +1594,25 @@ void DrawPreview(HDC target, HWND window, PaintBuffer& buffer, bool compact = fa
             const int viewWidth = area.right - area.left;
             const int viewHeight = area.bottom - area.top;
             if (viewWidth > 0 && viewHeight > 0) {
+                const BYTE* framePixels = g_latestFrame.pixels.data();
+                if (compact && g_pipHover) {
+                    // Reuse a scratch buffer so hover does not allocate a new
+                    // full-frame vector on every paint. If memory is tight,
+                    // keep the live picture rather than failing the paint.
+                    try {
+                        g_pipDimFrameScratch.resize(g_latestFrame.pixels.size());
+                        std::copy(g_latestFrame.pixels.begin(), g_latestFrame.pixels.end(),
+                            g_pipDimFrameScratch.begin());
+                        for (size_t i = 0; i + 3 < g_pipDimFrameScratch.size(); i += 4) {
+                            g_pipDimFrameScratch[i] = static_cast<BYTE>((g_pipDimFrameScratch[i] * 45) / 100);
+                            g_pipDimFrameScratch[i + 1] = static_cast<BYTE>((g_pipDimFrameScratch[i + 1] * 45) / 100);
+                            g_pipDimFrameScratch[i + 2] = static_cast<BYTE>((g_pipDimFrameScratch[i + 2] * 45) / 100);
+                        }
+                        framePixels = g_pipDimFrameScratch.data();
+                    } catch (...) {
+                        framePixels = g_latestFrame.pixels.data();
+                    }
+                }
                 const double scale = std::min(static_cast<double>(viewWidth) / g_latestFrame.width,
                                               static_cast<double>(viewHeight) / g_latestFrame.height);
                 const int drawWidth = std::max(1, static_cast<int>(g_latestFrame.width * scale));
@@ -1601,7 +1628,7 @@ void DrawPreview(HDC target, HWND window, PaintBuffer& buffer, bool compact = fa
                 bitmapInfo.bmiHeader.biCompression = BI_RGB;
                 SetStretchBltMode(buffer.dc, COLORONCOLOR);
                 StretchDIBits(buffer.dc, x, y, drawWidth, drawHeight, 0, 0,
-                    g_latestFrame.width, g_latestFrame.height, g_latestFrame.pixels.data(),
+                    g_latestFrame.width, g_latestFrame.height, framePixels,
                     &bitmapInfo, DIB_RGB_COLORS, SRCCOPY);
             }
         }
@@ -1616,6 +1643,10 @@ void DrawPreview(HDC target, HWND window, PaintBuffer& buffer, bool compact = fa
         if (oldFont) SelectObject(buffer.dc, oldFont);
     }
 
+    // PiP hover controls are drawn into the same back buffer so the user sees
+    // one atomic presentation rather than a video blit followed by an overlay blit.
+    if (compact && g_pipHover) DrawPipHoverActions(buffer.dc, window);
+
     // Present the completed frame in one operation to prevent visible clears
     // and partial GDI redraws in the main preview and the PiP window.
     BitBlt(target, 0, 0, width, height, buffer.dc, 0, 0, SRCCOPY);
@@ -1625,8 +1656,21 @@ void InvalidateVideoSurface(HWND target) {
     if (!target || !IsWindow(target)) return;
     RECT area{};
     GetClientRect(target, &area);
-    if (target == g_hwnd && g_windowMode == 0) area.top = 94;
     if (area.top < area.bottom) InvalidateRect(target, &area, FALSE);
+}
+
+bool IsAnyToolbarComboDropped() {
+    const HWND combos[] = { g_videoCombo, g_audioCombo, g_resolutionCombo };
+    for (HWND combo : combos) {
+        if (combo && IsWindow(combo) && SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0))
+            return true;
+    }
+    return false;
+}
+
+bool IsToolbarControlFocused() {
+    const HWND focused = GetFocus();
+    return focused && g_hwnd && IsChild(g_hwnd, focused);
 }
 
 void ShowToolbarControls(bool visible) {
@@ -1639,45 +1683,192 @@ void ShowToolbarControls(bool visible) {
     };
     for (int id : ids) {
         HWND control = GetDlgItem(g_hwnd, id);
-        if (control) ShowWindow(control, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+        if (!control) continue;
+        if (visible) {
+            SetWindowPos(control, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOREDRAW);
+            ShowWindow(control, SW_SHOWNOACTIVATE);
+        } else {
+            ShowWindow(control, SW_HIDE);
+        }
     }
     g_overlayVisible = visible;
+
+    if (visible) {
+        // Keep the background below all controls, then force a complete
+        // synchronous repaint so the controls do not remain as gray blanks
+        // until the pointer happens to pass over each individual control.
+        if (g_toolbarBackground) {
+            SetWindowPos(g_toolbarBackground, HWND_BOTTOM, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);
+        }
+        RECT toolbarRect{};
+        GetClientRect(g_hwnd, &toolbarRect);
+        toolbarRect.bottom = std::min<LONG>(toolbarRect.bottom, 100);
+        RedrawWindow(g_hwnd, &toolbarRect, nullptr,
+            RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_NOERASE);
+        for (int id : ids) {
+            HWND control = GetDlgItem(g_hwnd, id);
+            if (control && IsWindowVisible(control))
+                RedrawWindow(control, nullptr, nullptr,
+                    RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_NOERASE);
+        }
+    }
     InvalidateVideoSurface(g_hwnd);
 }
 
 void UpdateOverlayVisibility(bool force) {
     if (!g_hwnd) return;
+
     if (g_windowMode == 0) {
-        KillTimer(g_hwnd, TIMER_OVERLAY);
         if (g_appMenu && GetMenu(g_hwnd) != g_appMenu) {
             SetMenu(g_hwnd, g_appMenu);
             DrawMenuBar(g_hwnd);
         }
-        if (force || !g_overlayVisible) ShowToolbarControls(true);
+    } else {
+        if (GetMenu(g_hwnd)) {
+            SetMenu(g_hwnd, nullptr);
+            DrawMenuBar(g_hwnd);
+        }
+    }
+
+    // A single hover policy is used in windowed and fullscreen modes.
+    if (!g_toolbarAutoShow) {
+        KillTimer(g_hwnd, TIMER_OVERLAY);
+        if (g_overlayVisible || force) ShowToolbarControls(false);
         return;
     }
 
-    if (GetMenu(g_hwnd)) {
-        SetMenu(g_hwnd, nullptr);
-        DrawMenuBar(g_hwnd);
-    }
-    SetTimer(g_hwnd, TIMER_OVERLAY, 90, nullptr);
-    POINT cursor{};
+    SetTimer(g_hwnd, TIMER_OVERLAY, 70, nullptr);
     bool inTopZone = false;
+    POINT cursor{};
     if (GetCursorPos(&cursor)) {
-        ScreenToClient(g_hwnd, &cursor);
-        RECT client{};
-        GetClientRect(g_hwnd, &client);
-        inTopZone = cursor.x >= 0 && cursor.x < client.right && cursor.y >= 0 && cursor.y <= 108;
+        POINT clientCursor = cursor;
+        if (ScreenToClient(g_hwnd, &clientCursor)) {
+            RECT client{};
+            GetClientRect(g_hwnd, &client);
+            // The complete 94 px toolbar remains interactive. The small
+            // tolerance below it avoids flicker when moving between controls.
+            inTopZone = clientCursor.x >= 0 && clientCursor.x < client.right &&
+                clientCursor.y >= 0 && clientCursor.y <= 104;
+        }
     }
-    if (force || inTopZone != g_overlayVisible) ShowToolbarControls(inTopZone);
+
+    // Native combo-box dropdowns are separate popup windows and may extend
+    // far below the toolbar. Keep the overlay visible until selection closes
+    // the list, otherwise lower resolutions cannot be clicked.
+    const bool comboIsOpen = IsAnyToolbarComboDropped();
+    const bool toolbarHasFocus = IsToolbarControlFocused();
+    const bool shouldShow = inTopZone || comboIsOpen || toolbarHasFocus;
+    if (force || shouldShow != g_overlayVisible) ShowToolbarControls(shouldShow);
+}
+
+struct PipActionRects {
+    RECT returnToMain{};
+    RECT closePip{};
+};
+
+PipActionRects GetPipActionRects(HWND hwnd) {
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    const int minDimension = static_cast<int>(std::min(client.right, client.bottom));
+    const int buttonSize = std::clamp(minDimension / 5, 48, 64);
+    const int gap = std::max(12, buttonSize / 4);
+    const int totalWidth = buttonSize * 2 + gap;
+    const int left = (client.right - totalWidth) / 2;
+    const int top = (client.bottom - buttonSize) / 2;
+    PipActionRects result;
+    result.returnToMain = { left, top, left + buttonSize, top + buttonSize };
+    result.closePip = { left + buttonSize + gap, top, left + buttonSize * 2 + gap, top + buttonSize };
+    return result;
+}
+
+bool PointInPipActionButton(HWND hwnd, POINT point) {
+    if (!g_pipHover) return false;
+    const PipActionRects buttons = GetPipActionRects(hwnd);
+    return PtInRect(&buttons.returnToMain, point) || PtInRect(&buttons.closePip, point);
+}
+
+void UpdatePipHover(HWND hwnd, bool hovered) {
+    if (g_pipHover == hovered) return;
+    g_pipHover = hovered;
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+void UpdatePipHoverFromCursor(HWND hwnd) {
+    POINT cursor{};
+    RECT windowRect{};
+    const bool inside = GetCursorPos(&cursor) && GetWindowRect(hwnd, &windowRect) &&
+        PtInRect(&windowRect, cursor) != FALSE;
+    // WM_MOUSELEAVE and WM_NCMOUSELEAVE can be raised when the pointer merely
+    // crosses between client and non-client hit-test areas. Do not remove the
+    // hover overlay unless the pointer has actually left the whole PiP window.
+    UpdatePipHover(hwnd, inside);
+}
+
+void DrawPipHoverActions(HDC dc, HWND hwnd) {
+    const PipActionRects buttons = GetPipActionRects(hwnd);
+    const int oldMode = SetBkMode(dc, TRANSPARENT);
+    HPEN whitePen = CreatePen(PS_SOLID, 3, RGB(242, 247, 255));
+    HPEN cyanPen = CreatePen(PS_SOLID, 3, RGB(83, 200, 242));
+    HPEN redPen = CreatePen(PS_SOLID, 3, RGB(245, 105, 105));
+    HBRUSH buttonBrush = CreateSolidBrush(RGB(34, 42, 54));
+    HGDIOBJ oldPen = SelectObject(dc, whitePen);
+    HGDIOBJ oldBrush = SelectObject(dc, buttonBrush);
+
+    auto drawButtonCircle = [&](const RECT& r) {
+        Ellipse(dc, r.left, r.top, r.right, r.bottom);
+    };
+    drawButtonCircle(buttons.returnToMain);
+    drawButtonCircle(buttons.closePip);
+
+    const int cx1 = (buttons.returnToMain.left + buttons.returnToMain.right) / 2;
+    const int cy1 = (buttons.returnToMain.top + buttons.returnToMain.bottom) / 2;
+    const int cx2 = (buttons.closePip.left + buttons.closePip.right) / 2;
+    const int cy2 = (buttons.closePip.top + buttons.closePip.bottom) / 2;
+    const int icon = std::max(18, static_cast<int>(buttons.returnToMain.right - buttons.returnToMain.left) / 2);
+
+    // First control: a window with an outward arrow (return to main app).
+    SelectObject(dc, cyanPen);
+    SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, cx1 - icon / 2, cy1 - icon / 2, cx1 + icon / 2, cy1 + icon / 2);
+    MoveToEx(dc, cx1 - 2, cy1 + icon / 3, nullptr);
+    LineTo(dc, cx1 + icon / 3, cy1 - icon / 3);
+    LineTo(dc, cx1 + icon / 3 - 1, cy1 - 3);
+    MoveToEx(dc, cx1 + icon / 3, cy1 - icon / 3, nullptr);
+    LineTo(dc, cx1 + 3, cy1 - icon / 3 + 1);
+
+    // Second control: a clearly recognizable close (X) button.
+    SelectObject(dc, redPen);
+    MoveToEx(dc, cx2 - icon / 3, cy2 - icon / 3, nullptr);
+    LineTo(dc, cx2 + icon / 3, cy2 + icon / 3);
+    MoveToEx(dc, cx2 + icon / 3, cy2 - icon / 3, nullptr);
+    LineTo(dc, cx2 - icon / 3, cy2 + icon / 3);
+
+    SelectObject(dc, oldPen);
+    SelectObject(dc, oldBrush);
+    SetBkMode(dc, oldMode);
+    DeleteObject(whitePen);
+    DeleteObject(cyanPen);
+    DeleteObject(redPen);
+    DeleteObject(buttonBrush);
+}
+
+void ReturnFromPipToMain(HWND pipWindow) {
+    ShowWindow(pipWindow, SW_HIDE);
+    g_pipHover = false;
+    if (g_hwnd && IsWindow(g_hwnd)) {
+        ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
+        SetForegroundWindow(g_hwnd);
+        SetFocus(g_hwnd);
+    }
 }
 
 LRESULT CALLBACK PipWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_NCCALCSIZE:
-        // Extend the client area over the complete window. WS_THICKFRAME is
-        // retained only for invisible resize hit zones.
+        // Draw only the video surface. The frame remains borderless; the
+        // non-client hit-test still provides invisible resize grips.
         return 0;
     case WM_NCPAINT:
     case WM_NCACTIVATE:
@@ -1693,6 +1884,33 @@ LRESULT CALLBACK PipWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
         return 1;
     case WM_SIZE:
         InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_GETMINMAXINFO: {
+        auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
+        info->ptMinTrackSize.x = 260;
+        info->ptMinTrackSize.y = 180;
+        return 0;
+    }
+    case WM_MOUSEACTIVATE:
+        // Clicking PiP must not steal foreground from the application behind it.
+        return MA_NOACTIVATE;
+    case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT tracking{ sizeof(tracking), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tracking);
+        UpdatePipHover(hwnd, true);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        UpdatePipHoverFromCursor(hwnd);
+        return 0;
+    case WM_NCMOUSEMOVE: {
+        TRACKMOUSEEVENT tracking{ sizeof(tracking), TME_LEAVE | TME_NONCLIENT, hwnd, 0 };
+        TrackMouseEvent(&tracking);
+        UpdatePipHover(hwnd, true);
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+    case WM_NCMOUSELEAVE:
+        UpdatePipHoverFromCursor(hwnd);
         return 0;
     case WM_NCHITTEST: {
         POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
@@ -1712,10 +1930,25 @@ LRESULT CALLBACK PipWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
         if (right) return HTRIGHT;
         if (top) return HTTOP;
         if (bottom) return HTBOTTOM;
+        if (PointInPipActionButton(hwnd, point)) return HTCLIENT;
         return HTCAPTION;
     }
+    case WM_LBUTTONUP: {
+        POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        const PipActionRects buttons = GetPipActionRects(hwnd);
+        if (g_pipHover && PtInRect(&buttons.returnToMain, point)) {
+            ReturnFromPipToMain(hwnd);
+            return 0;
+        }
+        if (g_pipHover && PtInRect(&buttons.closePip, point)) {
+            ShowWindow(hwnd, SW_HIDE);
+            g_pipHover = false;
+            return 0;
+        }
+        break;
+    }
     case WM_NCLBUTTONDBLCLK:
-        if (g_hwnd) ShowWindow(g_hwnd, IsIconic(g_hwnd) ? SW_RESTORE : SW_SHOW);
+        ReturnFromPipToMain(hwnd);
         return 0;
     case WM_CONTEXTMENU: {
         POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
@@ -1728,14 +1961,18 @@ LRESULT CALLBACK PipWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
         return 0;
     }
     case WM_COMMAND:
-        if (LOWORD(wParam) == IDM_PIP_CLOSE) { ShowWindow(hwnd, SW_HIDE); return 0; }
+        if (LOWORD(wParam) == IDM_PIP_CLOSE) { ShowWindow(hwnd, SW_HIDE); g_pipHover = false; return 0; }
         if (LOWORD(wParam) == IDM_PIP_TOPMOST) { TogglePipTopmost(); return 0; }
         break;
     case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE) { ShowWindow(hwnd, SW_HIDE); return 0; }
+        if (wParam == VK_ESCAPE) { ShowWindow(hwnd, SW_HIDE); g_pipHover = false; return 0; }
+        break;
+    case WM_SHOWWINDOW:
+        if (!wParam) g_pipHover = false;
         break;
     case WM_CLOSE:
         ShowWindow(hwnd, SW_HIDE);
+        g_pipHover = false;
         return 0;
     case WM_DESTROY:
         DestroyPaintBuffer(g_pipPaintBuffer);
@@ -1752,7 +1989,7 @@ void TogglePictureInPicture() {
         return;
     }
     if (!g_pipHwnd) {
-        DWORD exStyle = WS_EX_TOOLWINDOW;
+        DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
         if (g_pipAlwaysOnTop) exStyle |= WS_EX_TOPMOST;
         g_pipHwnd = CreateWindowExW(exStyle, kPipWindowClass, L"PlayView PiP",
             WS_POPUP | WS_THICKFRAME | WS_VISIBLE, 120, 120, 520, 310,
@@ -1913,12 +2150,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case IDC_PIP: TogglePictureInPicture(); return 0;
         case IDM_VIEW_PIP: TogglePictureInPicture(); return 0;
         case IDM_PIP_TOPMOST: TogglePipTopmost(); return 0;
+        case IDM_SHOW_TOOLBAR:
+            g_toolbarAutoShow = !g_toolbarAutoShow;
+            g_settings.showToolbar = g_toolbarAutoShow;
+            if (!g_toolbarAutoShow) ShowToolbarControls(false);
+            else UpdateOverlayVisibility(true);
+            SaveSettings();
+            RequestMenuRebuild();
+            return 0;
         case IDM_VIEW_WINDOW: SetWindowMode(0); return 0;
-        case IDM_VIEW_BORDERLESS: SetWindowMode(1); return 0;
         case IDM_VIEW_FULLSCREEN: SetWindowMode(g_windowMode == 2 ? 0 : 2); return 0;
         case IDM_EXIT: PostMessageW(hwnd, WM_CLOSE, 0, 0); return 0;
         case IDM_ABOUT:
-            MessageBoxW(hwnd, L"PlayView 0.2.2\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation.",
+            MessageBoxW(hwnd, L"PlayView 0.2.3\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation.",
                 L"Acerca de PlayView", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
@@ -1941,7 +2185,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             StartSelectedAudio(true);
             return 0;
         }
-        if (wParam == VK_ESCAPE && g_windowMode != 0) { SetWindowMode(0); return 0; }
+        if (wParam == VK_ESCAPE && g_windowMode == 2) { SetWindowMode(0); return 0; }
         break;
     case WM_APP_FRAME:
         g_frameMessagePending.store(false);
@@ -2033,8 +2277,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         if (lParam == -1) GetCursorPos(&point);
         HMENU context = CreatePopupMenu();
-        AppendMenuW(context, MF_STRING, IDM_VIEW_WINDOW, L"Volver a ventana");
-        AppendMenuW(context, MF_STRING, IDM_VIEW_BORDERLESS, L"Ventana sin bordes");
+        AppendMenuW(context, MF_STRING, IDM_VIEW_WINDOW, L"Ventana");
         AppendMenuW(context, MF_STRING, IDM_VIEW_FULLSCREEN, L"Pantalla completa");
         AppendMenuW(context, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(context, MF_STRING, IDM_VIEW_PIP, L"Picture in Picture");
