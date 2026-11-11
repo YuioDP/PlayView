@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(PlayView VERSION 0.2.0 LANGUAGES CXX RC)
+project(PlayView VERSION 0.2.1 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -26,6 +26,13 @@ add_executable(PlayView WIN32
 
 target_include_directories(PlayView PRIVATE resources)
 target_compile_definitions(PlayView PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX WINVER=0x0A00 _WIN32_WINNT=0x0A00)
+# The custom application manifest is embedded from PlayView.rc.
+# Disable the linker's automatic manifest embedding to avoid a duplicate
+# RT_MANIFEST resource (CVTRES : fatal error CVT1100).
+if(MSVC)
+    target_link_options(PlayView PRIVATE /MANIFEST:NO)
+endif()
+
 target_link_libraries(PlayView PRIVATE
     mf
     mfplat

@@ -607,7 +607,7 @@ std::vector<VideoMode> EnumerateVideoModes(const std::wstring& deviceId) {
 
     for (DWORD index = 0; index < 128; ++index) {
         ComPtr<IMFMediaType> mediaType;
-        hr = reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, index, &mediaType);
+        hr = reader->GetNativeMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), index, &mediaType);
         if (hr == MF_E_NO_MORE_TYPES) break;
         if (FAILED(hr)) continue;
         UINT32 width = 0, height = 0;
@@ -683,14 +683,14 @@ private:
             if (SUCCEEDED(hr) && requestedWidth > 0 && requestedHeight > 0)
                 hr = MFSetAttributeSize(requestedType.Get(), MF_MT_FRAME_SIZE, requestedWidth, requestedHeight);
             if (SUCCEEDED(hr)) hr = requestedType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-            if (SUCCEEDED(hr)) hr = reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, requestedType.Get());
+            if (SUCCEEDED(hr)) hr = reader->SetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr, requestedType.Get());
         }
 
         UINT32 frameWidth = 0, frameHeight = 0;
         LONG stride = 0;
         if (SUCCEEDED(hr)) {
             ComPtr<IMFMediaType> currentType;
-            hr = reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &currentType);
+            hr = reader->GetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), &currentType);
             if (SUCCEEDED(hr)) hr = MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &frameWidth, &frameHeight);
             UINT32 strideValue = 0;
             if (SUCCEEDED(hr) && SUCCEEDED(currentType->GetUINT32(MF_MT_DEFAULT_STRIDE, &strideValue))) stride = static_cast<LONG>(strideValue);
@@ -712,13 +712,13 @@ private:
             DWORD streamIndex = 0, flags = 0;
             LONGLONG timestamp = 0;
             ComPtr<IMFSample> sample;
-            hr = reader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &streamIndex, &flags, &timestamp, &sample);
+            hr = reader->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, &streamIndex, &flags, &timestamp, &sample);
             if (FAILED(hr) || (flags & MF_SOURCE_READERF_ERROR)) break;
             if (flags & MF_SOURCE_READERF_ENDOFSTREAM) break;
             if (flags & (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED | MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED)) {
                 ComPtr<IMFMediaType> changedType;
                 UINT32 changedWidth = 0, changedHeight = 0;
-                if (SUCCEEDED(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &changedType)) &&
+                if (SUCCEEDED(reader->GetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), &changedType)) &&
                     SUCCEEDED(MFGetAttributeSize(changedType.Get(), MF_MT_FRAME_SIZE, &changedWidth, &changedHeight)) &&
                     changedWidth > 0 && changedHeight > 0) {
                     frameWidth = changedWidth;
@@ -832,7 +832,7 @@ private:
             if (SUCCEEDED(hr)) hr = pcmType->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
             if (SUCCEEDED(hr)) hr = pcmType->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 192000);
             if (SUCCEEDED(hr)) hr = pcmType->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
-            if (SUCCEEDED(hr)) hr = reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr, pcmType.Get());
+            if (SUCCEEDED(hr)) hr = reader->SetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM), nullptr, pcmType.Get());
         }
 
         HWAVEOUT output = nullptr;
@@ -871,7 +871,7 @@ private:
             DWORD streamIndex = 0, flags = 0;
             LONGLONG timestamp = 0;
             ComPtr<IMFSample> sample;
-            hr = reader->ReadSample(MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &streamIndex, &flags, &timestamp, &sample);
+            hr = reader->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM), 0, &streamIndex, &flags, &timestamp, &sample);
             if (FAILED(hr) || (flags & MF_SOURCE_READERF_ERROR) || (flags & MF_SOURCE_READERF_ENDOFSTREAM)) break;
             if (!sample) { Sleep(1); continue; }
 
@@ -1226,7 +1226,7 @@ void CreateAppMenu(HWND hwnd) {
     if (oldMenu) DestroyMenu(oldMenu);
 }
 
-void LayoutControls(int width, int height) {
+void LayoutControls(int width, int /*height*/) {
     const int margin = 12;
     const int row1 = 8;
     const int labelW = 75;
@@ -1492,7 +1492,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case IDM_VIEW_FULLSCREEN: SetWindowMode(g_windowMode == 2 ? 0 : 2); return 0;
         case IDM_EXIT: DestroyWindow(hwnd); return 0;
         case IDM_ABOUT:
-            MessageBoxW(hwnd, L"PlayView 0.2.0\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation.",
+            MessageBoxW(hwnd, L"PlayView 0.2.1\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation.",
                 L"Acerca de PlayView", MB_OK | MB_ICONINFORMATION);
             return 0;
         }

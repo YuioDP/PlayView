@@ -2,7 +2,7 @@
 
 **PlayView** es un monitor ligero de capturadoras para Windows. Está diseñado para mostrar la señal de una consola en una ventana sencilla, sin las funciones generales de un reproductor multimedia.
 
-> Versión de desarrollo: **0.2.0**. El proyecto incorpora captura de video y audio mediante interfaces nativas de Windows, ventana Picture in Picture y perfiles independientes. Antes de considerarlo estable debe compilarse en Windows y probarse con el modelo concreto de capturadora.
+> Versión de desarrollo: **0.2.1**. El proyecto incorpora captura de video y audio mediante interfaces nativas de Windows, ventana Picture in Picture y perfiles independientes. Antes de considerarlo estable debe compilarse en Windows y probarse con el modelo concreto de capturadora.
 
 ## Funciones
 
@@ -109,8 +109,8 @@ Las instrucciones de publicación por Git también están en `INSTRUCCIONES_GITH
 Para generar una GitHub Release, crea y publica una etiqueta:
 
 ```powershell
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 ## Perfiles: funcionamiento
@@ -153,3 +153,7 @@ Esta versión es una base de desarrollo y necesita validación con hardware real
 - Microsoft Learn, [MFCreateDeviceSource](https://learn.microsoft.com/en-us/windows/win32/api/mfidl/nf-mfidl-mfcreatedevicesource).
 - Microsoft Learn, [Capture Device Attributes](https://learn.microsoft.com/en-us/windows/win32/medfound/capture-device-attributes).
 - Microsoft Learn, [Windows Imaging Component](https://learn.microsoft.com/en-us/windows/win32/wic/-wic-about-windows-imaging-codec).
+
+## Corrección de compilación 0.2.1
+
+Se deshabilita la inserción automática del manifiesto por parte del enlazador de MSVC (`/MANIFEST:NO`) porque el manifiesto personalizado ya se incorpora desde `resources/app.rc.in`. Esto evita el recurso `RT_MANIFEST` duplicado que provocaba `CVTRES : fatal error CVT1100`. También se explicitan las conversiones de los índices de flujo de Media Foundation para eliminar las advertencias C4245 y se elimina el nombre de un parámetro no utilizado.
