@@ -79,6 +79,139 @@ constexpr int IDM_PROFILE_ICON_BASE = 2500;
 constexpr int IDM_PIP_CLOSE = 2600;
 constexpr int ID_PROFILE_MENU_LIMIT = 100;
 
+enum class LanguagePreference : int { Automatic = 0, Spanish = 1, English = 2 };
+enum class UiLanguage { Spanish, English };
+
+enum class TextId {
+    VideoSelect, AudioUnconfigured,
+    SettingsMenu, LanguageMenu, LanguageAutomatic, LanguageSpanish, LanguageEnglish,
+    FileMenu, ViewMenu, HelpMenu, ShowToolbar, Exit,
+    Windowed, Fullscreen, PipMenu, PipAlwaysOnTop, About,
+    Profiles, SaveCurrentProfile, UseMainSettings, NoSavedProfiles,
+    LoadProfile, CreateDesktopShortcut, ChangeProfileIcon, DeleteProfile,
+    ImageFileFilter, SelectProfileLogo, ProfileFileFilter, SavePlayViewProfile,
+    ProfilesMustStayInAppData, InvalidProfileName, AskProfileLogo, ProfileLogoTitle,
+    IconCopyFailedDefault, ProfileSavedAskShortcut, ProfileCreated,
+    ShortcutCreated, ShortcutCreationFailed, ProfileSaveFileError,
+    ProfileSaveRuntimeError, ProfileSaveUnexpectedError,
+    CannotDeleteActiveProfile, DeleteProfileQuestion, DeleteProfileTitle,
+    IconCopyFailed, NotFoundPrefix, AutomaticResolution,
+    SelectCaptureDevice, SelectCaptureAudio,
+    VideoFoundStarting, VideoMissingPrefix, UnknownDevice, NoCaptureDevices,
+    AudioConnected, AudioMissing, VideoConnecting, VideoReconnecting,
+    VideoActive, VideoSignalLostRetry, AudioDisconnectedRetry,
+    VideoWaitingFrames, CheckHdmiInput, VideoStoppedFrames, PressF5ToReload,
+    CapturesResynced, ReloadButton, PipButton, MuteButton, UnmuteButton,
+    ResyncButton, CaptureDeviceLabel, AudioLabel, ResolutionLabel, VolumeLabel,
+    HidePip, AlwaysOnTop, PipCreateFailed,
+    AboutBody, AboutTitle, MediaFoundationStartupError,
+    ShowPip, WindowTitleProfile
+};
+
+LanguagePreference g_languagePreference = LanguagePreference::Automatic;
+UiLanguage g_uiLanguage = UiLanguage::Spanish;
+
+const wchar_t* Tr(TextId id) {
+    const bool en = g_uiLanguage == UiLanguage::English;
+    switch (id) {
+    case TextId::VideoSelect: return en ? L"Select a capture device to begin." : L"Selecciona una capturadora para comenzar.";
+    case TextId::AudioUnconfigured: return en ? L"Audio not configured." : L"Audio sin configurar.";
+    case TextId::SettingsMenu: return en ? L"Settings" : L"Ajustes";
+    case TextId::LanguageMenu: return en ? L"Language" : L"Idioma";
+    case TextId::LanguageAutomatic: return en ? L"Automatic (Windows display language)" : L"Automático (idioma de Windows)";
+    case TextId::LanguageSpanish: return L"Español";
+    case TextId::LanguageEnglish: return L"English";
+    case TextId::FileMenu: return en ? L"File" : L"Archivo";
+    case TextId::ViewMenu: return en ? L"View" : L"Ver";
+    case TextId::HelpMenu: return en ? L"Help" : L"Ayuda";
+    case TextId::ShowToolbar: return en ? L"Show options bar" : L"Mostrar barra de opciones";
+    case TextId::Exit: return en ? L"Exit" : L"Salir";
+    case TextId::Windowed: return en ? L"Windowed" : L"Ventana";
+    case TextId::Fullscreen: return en ? L"Fullscreen\tF11" : L"Pantalla completa\tF11";
+    case TextId::PipMenu: return en ? L"Picture in Picture\tCtrl+Shift+P" : L"Imagen en imagen\tCtrl+Mayús+P";
+    case TextId::PipAlwaysOnTop: return en ? L"PiP always on top" : L"PiP siempre visible";
+    case TextId::About: return en ? L"About PlayView" : L"Acerca de PlayView";
+    case TextId::Profiles: return en ? L"Profiles" : L"Perfiles";
+    case TextId::SaveCurrentProfile: return en ? L"Save current settings as a profile..." : L"Guardar configuración actual como perfil...";
+    case TextId::UseMainSettings: return en ? L"Use main settings" : L"Usar configuración principal";
+    case TextId::NoSavedProfiles: return en ? L"No saved profiles" : L"No hay perfiles guardados";
+    case TextId::LoadProfile: return en ? L"Load profile" : L"Cargar perfil";
+    case TextId::CreateDesktopShortcut: return en ? L"Create desktop shortcut" : L"Crear acceso directo en el escritorio";
+    case TextId::ChangeProfileIcon: return en ? L"Change profile icon" : L"Cambiar logo del perfil";
+    case TextId::DeleteProfile: return en ? L"Delete profile" : L"Eliminar perfil";
+    case TextId::ImageFileFilter: return en ? L"Images and icons (*.ico;*.png;*.jpg;*.jpeg;*.bmp)\0*.ico;*.png;*.jpg;*.jpeg;*.bmp\0All files (*.*)\0*.*\0" : L"Imágenes e iconos (*.ico;*.png;*.jpg;*.jpeg;*.bmp)\0*.ico;*.png;*.jpg;*.jpeg;*.bmp\0Todos los archivos (*.*)\0*.*\0";
+    case TextId::SelectProfileLogo: return en ? L"Select profile logo" : L"Seleccionar logo del perfil";
+    case TextId::ProfileFileFilter: return en ? L"PlayView profile (*.ini)\0*.ini\0" : L"Perfil PlayView (*.ini)\0*.ini\0";
+    case TextId::SavePlayViewProfile: return en ? L"Save PlayView profile" : L"Guardar perfil de PlayView";
+    case TextId::ProfilesMustStayInAppData: return en ? L"Profiles must be saved inside the PlayView data folder." : L"Los perfiles deben guardarse dentro de la carpeta de datos de PlayView.";
+    case TextId::InvalidProfileName: return en ? L"The profile name is not valid." : L"El nombre del perfil no es válido.";
+    case TextId::AskProfileLogo: return en ? L"Would you like to assign a custom logo to this profile? Supported formats: .ico, .png, .jpg, .jpeg and .bmp." : L"¿Deseas asignar un logo personalizado a este perfil? Se admiten .ico, .png, .jpg, .jpeg y .bmp.";
+    case TextId::ProfileLogoTitle: return en ? L"Profile logo" : L"Logo del perfil";
+    case TextId::IconCopyFailedDefault: return en ? L"The icon could not be copied. The default icon will be used." : L"No se pudo copiar el icono. Se utilizará el icono predeterminado.";
+    case TextId::ProfileSavedAskShortcut: return en ? L"The profile was saved. Would you like to create a desktop shortcut with its name and logo?" : L"El perfil se guardó. ¿Deseas crear ahora un acceso directo en el escritorio con su nombre y logo?";
+    case TextId::ProfileCreated: return en ? L"Profile created" : L"Perfil creado";
+    case TextId::ShortcutCreated: return en ? L"Desktop shortcut created." : L"Acceso directo creado en el escritorio.";
+    case TextId::ShortcutCreationFailed: return en ? L"Could not create the shortcut." : L"No se pudo crear el acceso directo.";
+    case TextId::ProfileSaveFileError: return en ? L"A file error occurred while saving the profile. See playview.log for details." : L"Ocurrió un problema al guardar el perfil. Consulta playview.log para más detalles.";
+    case TextId::ProfileSaveRuntimeError: return en ? L"An error occurred while saving the profile. The application will remain open." : L"Ocurrió un error al guardar el perfil. La aplicación continuará abierta.";
+    case TextId::ProfileSaveUnexpectedError: return en ? L"An unexpected error occurred while saving the profile. The application will remain open." : L"Ocurrió un error inesperado al guardar el perfil. La aplicación continuará abierta.";
+    case TextId::CannotDeleteActiveProfile: return en ? L"You cannot delete the profile currently in use. Switch to another profile first." : L"No puedes eliminar el perfil que está en uso. Cambia primero a otro perfil.";
+    case TextId::DeleteProfileQuestion: return en ? L"Delete profile '" : L"¿Eliminar el perfil '";
+    case TextId::DeleteProfileTitle: return en ? L"Delete profile" : L"Eliminar perfil";
+    case TextId::IconCopyFailed: return en ? L"The selected icon could not be copied." : L"No se pudo copiar el icono seleccionado.";
+    case TextId::NotFoundPrefix: return en ? L"Not found: " : L"No encontrado: ";
+    case TextId::AutomaticResolution: return en ? L"Automatic" : L"Automática";
+    case TextId::SelectCaptureDevice: return en ? L"Select a capture device..." : L"Selecciona una capturadora...";
+    case TextId::SelectCaptureAudio: return en ? L"Select capture card audio..." : L"Selecciona el audio de la capturadora...";
+    case TextId::VideoFoundStarting: return en ? L"Capture device found. Starting video..." : L"Capturadora encontrada. Iniciando señal...";
+    case TextId::VideoMissingPrefix: return en ? L"Saved capture device not found: " : L"No se encontró la capturadora guardada: ";
+    case TextId::UnknownDevice: return en ? L"unknown device" : L"dispositivo desconocido";
+    case TextId::NoCaptureDevices: return en ? L"No capture devices detected." : L"No se detectaron capturadoras.";
+    case TextId::AudioConnected: return en ? L"Audio connected" : L"Audio conectado";
+    case TextId::AudioMissing: return en ? L"Saved audio device not found" : L"No se encontró el audio guardado";
+    case TextId::VideoConnecting: return en ? L"Connecting to " : L"Conectando con ";
+    case TextId::VideoReconnecting: return en ? L"Capture device recovered. Reconnecting..." : L"Capturadora recuperada. Reconectando...";
+    case TextId::VideoActive: return en ? L"Capture active" : L"Captura activa";
+    case TextId::VideoSignalLostRetry: return en ? L"Signal lost or capture device disconnected. Looking for the same device..." : L"Se perdió la señal o la capturadora se desconectó. Buscando el mismo dispositivo...";
+    case TextId::AudioDisconnectedRetry: return en ? L"Audio disconnected. Looking for the same device..." : L"Audio desconectado. Buscando el mismo dispositivo...";
+    case TextId::VideoWaitingFrames: return en ? L"Waiting for video frames. Check the capture card HDMI input." : L"Esperando fotogramas. Comprueba la entrada HDMI de la capturadora.";
+    case TextId::CheckHdmiInput: return en ? L"Check the capture card HDMI input." : L"Comprueba la entrada HDMI de la capturadora.";
+    case TextId::VideoStoppedFrames: return en ? L"The capture device stopped sending frames. Press F5 to refresh." : L"La capturadora dejó de enviar fotogramas. Pulsa F5 para recargar.";
+    case TextId::PressF5ToReload: return en ? L"Press F5 to refresh." : L"Pulsa F5 para recargar.";
+    case TextId::CapturesResynced: return en ? L"Captures restarted for resynchronization" : L"Capturas reiniciadas para resincronización";
+    case TextId::ReloadButton: return en ? L"Refresh (F5)" : L"Recargar (F5)";
+    case TextId::PipButton: return L"PiP";
+    case TextId::MuteButton: return en ? L"Mute" : L"Silenciar";
+    case TextId::UnmuteButton: return en ? L"Unmute" : L"Activar";
+    case TextId::ResyncButton: return en ? L"Resync" : L"Resincronizar";
+    case TextId::CaptureDeviceLabel: return en ? L"Capture" : L"Capturadora";
+    case TextId::AudioLabel: return L"Audio";
+    case TextId::ResolutionLabel: return en ? L"Resolution" : L"Resolución";
+    case TextId::VolumeLabel: return en ? L"Volume: " : L"Volumen: ";
+    case TextId::HidePip: return en ? L"Hide Picture in Picture" : L"Ocultar imagen en imagen";
+    case TextId::AlwaysOnTop: return en ? L"Always on top" : L"Siempre visible";
+    case TextId::PipCreateFailed: return en ? L"Could not create the Picture in Picture window." : L"No se pudo crear la ventana de imagen en imagen.";
+    case TextId::AboutBody: return en ? L"PlayView 1.1.0\nA lightweight monitor for video capture devices.\n\nCapture powered by Windows Media Foundation." : L"PlayView 1.1.0\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation.";
+    case TextId::AboutTitle: return en ? L"About PlayView" : L"Acerca de PlayView";
+    case TextId::MediaFoundationStartupError: return en ? L"Could not initialize Windows Media Foundation. Make sure Windows is up to date." : L"No se pudo iniciar Windows Media Foundation. Comprueba que Windows esté actualizado.";
+    case TextId::ShowPip: return en ? L"Show Picture in Picture" : L"Mostrar imagen en imagen";
+    case TextId::WindowTitleProfile: return en ? L"PlayView | " : L"PlayView | ";
+    }
+    return L"";
+}
+
+UiLanguage ResolveUiLanguage(LanguagePreference preference) {
+    if (preference == LanguagePreference::Spanish) return UiLanguage::Spanish;
+    if (preference == LanguagePreference::English) return UiLanguage::English;
+    LANGID systemLanguage = GetUserDefaultUILanguage();
+    if (systemLanguage == 0) systemLanguage = GetUserDefaultLangID();
+    const LANGID primary = PRIMARYLANGID(systemLanguage);
+    if (primary == LANG_SPANISH) return UiLanguage::Spanish;
+    if (primary == LANG_ENGLISH) return UiLanguage::English;
+    // Spanish is the fallback when Windows reports an unsupported language.
+    return UiLanguage::Spanish;
+}
+
 struct DeviceInfo {
     std::wstring name;
     std::wstring id;
@@ -156,8 +289,8 @@ std::atomic_bool g_muted{ false };
 std::atomic_bool g_videoHasFrame{ false };
 std::atomic<ULONGLONG> g_lastVideoFrameTick{ 0 };
 ULONGLONG g_videoStartTick = 0;
-std::wstring g_videoStatus = L"Selecciona una capturadora para comenzar.";
-std::wstring g_audioStatus = L"Audio sin configurar.";
+std::wstring g_videoStatus;
+std::wstring g_audioStatus;
 std::wstring g_statusText;
 ULONGLONG g_nextVideoRetry = 0;
 ULONGLONG g_nextAudioRetry = 0;
@@ -183,6 +316,18 @@ std::wstring g_activeProfileName;
 std::vector<ProfileEntry> g_profileMenuEntries;
 bool g_pipAlwaysOnTop = true;
 
+void LoadLanguagePreference() {
+    const int saved = GetPrivateProfileIntW(L"General", L"Language", 0, g_settingsPath.c_str());
+    g_languagePreference = (saved >= 0 && saved <= 2)
+        ? static_cast<LanguagePreference>(saved) : LanguagePreference::Automatic;
+    g_uiLanguage = ResolveUiLanguage(g_languagePreference);
+}
+
+void SaveLanguagePreference() {
+    const std::wstring value = std::to_wstring(static_cast<int>(g_languagePreference));
+    WritePrivateProfileStringW(L"General", L"Language", value.c_str(), g_settingsPath.c_str());
+}
+
 void RefreshDevices(bool initial = false);
 void SetWindowMode(int mode);
 void CreateAppMenu(HWND hwnd);
@@ -191,6 +336,7 @@ void UpdateOverlayVisibility(bool force = false);
 void InvalidateVideoSurface(HWND target);
 void CaptureNormalWindowPlacement();
 void RequestMenuRebuild();
+void ApplyLanguageChange(LanguagePreference preference);
 void ApplyLoadedWindowPreferences();
 void DrawPipHoverActions(HDC dc, HWND hwnd);
 
@@ -509,10 +655,10 @@ bool PickIconFile(std::filesystem::path& selectedPath) {
     OPENFILENAMEW dialog{};
     dialog.lStructSize = sizeof(dialog);
     dialog.hwndOwner = g_hwnd;
-    dialog.lpstrFilter = L"Imágenes e iconos (*.ico;*.png;*.jpg;*.jpeg;*.bmp)\0*.ico;*.png;*.jpg;*.jpeg;*.bmp\0Todos los archivos (*.*)\0*.*\0";
+    dialog.lpstrFilter = Tr(TextId::ImageFileFilter);
     dialog.lpstrFile = file;
     dialog.nMaxFile = static_cast<DWORD>(std::size(file));
-    dialog.lpstrTitle = L"Seleccionar logo del perfil";
+    dialog.lpstrTitle = Tr(TextId::SelectProfileLogo);
     dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
     dialog.lpstrDefExt = L"ico";
     if (!GetOpenFileNameW(&dialog)) return false;
@@ -532,18 +678,18 @@ bool SaveProfileIcon(const std::filesystem::path& source, const std::filesystem:
 void RebuildProfilesMenu(HMENU menu) {
     g_profileMenuEntries = EnumerateProfiles();
     HMENU profilesMenu = CreatePopupMenu();
-    AppendMenuW(profilesMenu, MF_STRING, IDM_PROFILE_SAVE, L"Guardar configuración actual como perfil...");
-    AppendMenuW(profilesMenu, MF_STRING, IDM_PROFILE_DEFAULT, L"Usar configuración principal");
+    AppendMenuW(profilesMenu, MF_STRING, IDM_PROFILE_SAVE, Tr(TextId::SaveCurrentProfile));
+    AppendMenuW(profilesMenu, MF_STRING, IDM_PROFILE_DEFAULT, Tr(TextId::UseMainSettings));
     AppendMenuW(profilesMenu, MF_SEPARATOR, 0, nullptr);
     HMENU loadMenu = CreatePopupMenu();
     HMENU shortcutMenu = CreatePopupMenu();
     HMENU deleteMenu = CreatePopupMenu();
     HMENU iconMenu = CreatePopupMenu();
     if (g_profileMenuEntries.empty()) {
-        AppendMenuW(loadMenu, MF_STRING | MF_GRAYED, 0, L"No hay perfiles guardados");
-        AppendMenuW(shortcutMenu, MF_STRING | MF_GRAYED, 0, L"No hay perfiles guardados");
-        AppendMenuW(deleteMenu, MF_STRING | MF_GRAYED, 0, L"No hay perfiles guardados");
-        AppendMenuW(iconMenu, MF_STRING | MF_GRAYED, 0, L"No hay perfiles guardados");
+        AppendMenuW(loadMenu, MF_STRING | MF_GRAYED, 0, Tr(TextId::NoSavedProfiles));
+        AppendMenuW(shortcutMenu, MF_STRING | MF_GRAYED, 0, Tr(TextId::NoSavedProfiles));
+        AppendMenuW(deleteMenu, MF_STRING | MF_GRAYED, 0, Tr(TextId::NoSavedProfiles));
+        AppendMenuW(iconMenu, MF_STRING | MF_GRAYED, 0, Tr(TextId::NoSavedProfiles));
     } else {
         const size_t count = std::min(g_profileMenuEntries.size(), static_cast<size_t>(ID_PROFILE_MENU_LIMIT));
         for (size_t i = 0; i < count; ++i) {
@@ -558,24 +704,25 @@ void RebuildProfilesMenu(HMENU menu) {
             AppendMenuW(iconMenu, MF_STRING, iconId, profile.name.c_str());
         }
     }
-    AppendMenuW(profilesMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(loadMenu), L"Cargar perfil");
-    AppendMenuW(profilesMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(shortcutMenu), L"Crear acceso directo en el escritorio");
-    AppendMenuW(profilesMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(iconMenu), L"Cambiar logo del perfil");
-    AppendMenuW(profilesMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(deleteMenu), L"Eliminar perfil");
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(profilesMenu), L"Perfiles");
+    AppendMenuW(profilesMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(loadMenu), Tr(TextId::LoadProfile));
+    AppendMenuW(profilesMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(shortcutMenu), Tr(TextId::CreateDesktopShortcut));
+    AppendMenuW(profilesMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(iconMenu), Tr(TextId::ChangeProfileIcon));
+    AppendMenuW(profilesMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(deleteMenu), Tr(TextId::DeleteProfile));
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(profilesMenu), Tr(TextId::Profiles));
 }
 
 void SaveCurrentAsProfile() {
     try {
-        wchar_t file[MAX_PATH] = L"Nuevo perfil.ini";
+        wchar_t file[MAX_PATH]{};
+        wcscpy_s(file, std::size(file), g_uiLanguage == UiLanguage::English ? L"New profile.ini" : L"Nuevo perfil.ini");
         OPENFILENAMEW dialog{};
         dialog.lStructSize = sizeof(dialog);
         dialog.hwndOwner = g_hwnd;
-        dialog.lpstrFilter = L"Perfil PlayView (*.ini)\0*.ini\0";
+        dialog.lpstrFilter = Tr(TextId::ProfileFileFilter);
         dialog.lpstrFile = file;
         dialog.nMaxFile = static_cast<DWORD>(std::size(file));
         dialog.lpstrInitialDir = g_profilesDirectory.c_str();
-        dialog.lpstrTitle = L"Guardar perfil de PlayView";
+        dialog.lpstrTitle = Tr(TextId::SavePlayViewProfile);
         dialog.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_EXPLORER;
         dialog.lpstrDefExt = L"ini";
         if (!GetSaveFileNameW(&dialog)) return;
@@ -587,21 +734,19 @@ void SaveCurrentAsProfile() {
         const auto chosenRoot = std::filesystem::weakly_canonical(profilePath.parent_path(), chosenError);
         if (rootError || chosenError || CompareStringOrdinal(profileRoot.c_str(), -1,
             chosenRoot.c_str(), -1, TRUE) != CSTR_EQUAL) {
-            MessageBoxW(g_hwnd, L"Los perfiles deben guardarse dentro de la carpeta de datos de PlayView.",
-                L"PlayView", MB_OK | MB_ICONWARNING);
+            MessageBoxW(g_hwnd, Tr(TextId::ProfilesMustStayInAppData), L"PlayView", MB_OK | MB_ICONWARNING);
             return;
         }
 
         const std::wstring profileName = profilePath.stem().wstring();
         if (profileName.empty()) {
-            MessageBoxW(g_hwnd, L"El nombre del perfil no es válido.", L"PlayView", MB_OK | MB_ICONWARNING);
+            MessageBoxW(g_hwnd, Tr(TextId::InvalidProfileName), L"PlayView", MB_OK | MB_ICONWARNING);
             return;
         }
 
         std::filesystem::path iconSource;
         if (MessageBoxW(g_hwnd,
-            L"¿Deseas asignar un logo personalizado a este perfil? Se admiten .ico, .png, .jpg, .jpeg y .bmp.",
-            L"Logo del perfil", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            Tr(TextId::AskProfileLogo), Tr(TextId::ProfileLogoTitle), MB_YESNO | MB_ICONQUESTION) == IDYES) {
             if (!PickIconFile(iconSource)) iconSource.clear();
         }
 
@@ -609,8 +754,7 @@ void SaveCurrentAsProfile() {
         if (!iconSource.empty()) {
             iconDestination = g_profileIconsDirectory / (profilePath.stem().wstring() + L".ico");
             if (!SaveProfileIcon(iconSource, iconDestination)) {
-                MessageBoxW(g_hwnd, L"No se pudo copiar el icono. Se utilizará el icono predeterminado.",
-                    L"PlayView", MB_OK | MB_ICONWARNING);
+                MessageBoxW(g_hwnd, Tr(TextId::IconCopyFailedDefault), L"PlayView", MB_OK | MB_ICONWARNING);
                 iconDestination.clear();
             }
         }
@@ -623,26 +767,22 @@ void SaveCurrentAsProfile() {
         ProfileEntry profile{ profileName, profilePath, iconDestination };
         RequestMenuRebuild();
         if (MessageBoxW(g_hwnd,
-            L"El perfil se guardó. ¿Deseas crear ahora un acceso directo en el escritorio con su nombre y logo?",
-            L"Perfil creado", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            Tr(TextId::ProfileSavedAskShortcut), Tr(TextId::ProfileCreated), MB_YESNO | MB_ICONQUESTION) == IDYES) {
             if (CreateProfileShortcut(profile))
-                MessageBoxW(g_hwnd, L"Acceso directo creado en el escritorio.", L"PlayView", MB_OK | MB_ICONINFORMATION);
+                MessageBoxW(g_hwnd, Tr(TextId::ShortcutCreated), L"PlayView", MB_OK | MB_ICONINFORMATION);
             else
-                MessageBoxW(g_hwnd, L"No se pudo crear el acceso directo.", L"PlayView", MB_OK | MB_ICONWARNING);
+                MessageBoxW(g_hwnd, Tr(TextId::ShortcutCreationFailed), L"PlayView", MB_OK | MB_ICONWARNING);
         }
     } catch (const std::filesystem::filesystem_error& error) {
         (void)error;
         Log(L"Error de archivos al guardar perfil.");
-        MessageBoxW(g_hwnd, L"Ocurrió un problema al guardar el perfil. Consulta playview.log para más detalles.",
-            L"PlayView", MB_OK | MB_ICONERROR);
+        MessageBoxW(g_hwnd, Tr(TextId::ProfileSaveFileError), L"PlayView", MB_OK | MB_ICONERROR);
     } catch (const std::exception&) {
         Log(L"Error de ejecución al guardar un perfil.");
-        MessageBoxW(g_hwnd, L"Ocurrió un error al guardar el perfil. La aplicación continuará abierta.",
-            L"PlayView", MB_OK | MB_ICONERROR);
+        MessageBoxW(g_hwnd, Tr(TextId::ProfileSaveRuntimeError), L"PlayView", MB_OK | MB_ICONERROR);
     } catch (...) {
         Log(L"Error inesperado al guardar un perfil.");
-        MessageBoxW(g_hwnd, L"Ocurrió un error inesperado al guardar el perfil. La aplicación continuará abierta.",
-            L"PlayView", MB_OK | MB_ICONERROR);
+        MessageBoxW(g_hwnd, Tr(TextId::ProfileSaveUnexpectedError), L"PlayView", MB_OK | MB_ICONERROR);
     }
 }
 
@@ -1085,10 +1225,10 @@ void LoadProfile(const ProfileEntry& profile) {
     g_activeProfileName = profile.name;
     LoadSettingsFrom(g_activeProfilePath);
     RequestMenuRebuild();
-    SetWindowTextW(g_hwnd, (L"PlayView | " + g_activeProfileName).c_str());
+    SetWindowTextW(g_hwnd, (std::wstring(Tr(TextId::WindowTitleProfile)) + g_activeProfileName).c_str());
     SendMessageW(g_volumeSlider, TBM_SETPOS, TRUE, g_settings.volume);
     
-    SetWindowTextW(g_muteButton, g_settings.muted ? L"Activar" : L"Silenciar");
+    SetWindowTextW(g_muteButton, g_settings.muted ? Tr(TextId::UnmuteButton) : Tr(TextId::MuteButton));
     ApplyLoadedWindowPreferences();
     RefreshDevices(true);
     Log(L"Perfil cargado: " + profile.name);
@@ -1096,11 +1236,11 @@ void LoadProfile(const ProfileEntry& profile) {
 
 void DeleteProfile(const ProfileEntry& profile) {
     if (profile.path == g_activeProfilePath) {
-        MessageBoxW(g_hwnd, L"No puedes eliminar el perfil que está en uso. Cambia primero a otro perfil.", L"PlayView", MB_OK | MB_ICONINFORMATION);
+        MessageBoxW(g_hwnd, Tr(TextId::CannotDeleteActiveProfile), L"PlayView", MB_OK | MB_ICONINFORMATION);
         return;
     }
-    const std::wstring question = L"¿Eliminar el perfil '" + profile.name + L"'? Los accesos directos existentes dejarán de funcionar.";
-    if (MessageBoxW(g_hwnd, question.c_str(), L"Eliminar perfil", MB_YESNO | MB_ICONWARNING) != IDYES) return;
+    const std::wstring question = std::wstring(Tr(TextId::DeleteProfileQuestion)) + profile.name + (g_uiLanguage == UiLanguage::English ? L"'? Existing shortcuts will no longer work." : L"'? Los accesos directos existentes dejarán de funcionar.");
+    if (MessageBoxW(g_hwnd, question.c_str(), Tr(TextId::DeleteProfileTitle), MB_YESNO | MB_ICONWARNING) != IDYES) return;
     std::error_code ec;
     std::filesystem::remove(profile.path, ec);
     if (!profile.iconPath.empty()) std::filesystem::remove(profile.iconPath, ec);
@@ -1112,7 +1252,7 @@ void ChangeProfileIcon(const ProfileEntry& profile) {
     if (!PickIconFile(iconSource)) return;
     const auto destination = g_profileIconsDirectory / (profile.path.stem().wstring() + L".ico");
     if (!SaveProfileIcon(iconSource, destination)) {
-        MessageBoxW(g_hwnd, L"No se pudo copiar el icono seleccionado.", L"PlayView", MB_OK | MB_ICONERROR);
+        MessageBoxW(g_hwnd, Tr(TextId::IconCopyFailed), L"PlayView", MB_OK | MB_ICONERROR);
         return;
     }
     WritePrivateProfileStringW(L"Profile", L"IconPath", destination.c_str(), profile.path.c_str());
@@ -1201,7 +1341,7 @@ void PopulateDeviceCombo(HWND combo, const std::vector<DeviceInfo>& devices,
         if (!selectedId.empty() && devices[i].id == selectedId) selectedIndex = static_cast<int>(index);
     }
     if (!selectedId.empty() && selectedIndex < 0) {
-        const std::wstring missing = L"No encontrado: " + (savedName.empty() ? selectedId : savedName);
+        const std::wstring missing = std::wstring(Tr(TextId::NotFoundPrefix)) + (savedName.empty() ? selectedId : savedName);
         selectedIndex = static_cast<int>(SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(missing.c_str())));
         SendMessageW(combo, CB_SETITEMDATA, selectedIndex, static_cast<LPARAM>(-1));
     }
@@ -1211,7 +1351,7 @@ void PopulateDeviceCombo(HWND combo, const std::vector<DeviceInfo>& devices,
 
 void PopulateResolutionCombo() {
     SendMessageW(g_resolutionCombo, CB_RESETCONTENT, 0, 0);
-    const LRESULT automatic = SendMessageW(g_resolutionCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Automática"));
+    const LRESULT automatic = SendMessageW(g_resolutionCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(Tr(TextId::AutomaticResolution)));
     SendMessageW(g_resolutionCombo, CB_SETITEMDATA, automatic, 0);
     int selected = 0;
     for (size_t i = 0; i < g_videoModes.size(); ++i) {
@@ -1227,8 +1367,8 @@ void PopulateResolutionCombo() {
 void RefreshDevices(bool initial) {
     g_videoDevices = EnumerateDevices(true);
     g_audioDevices = EnumerateDevices(false);
-    PopulateDeviceCombo(g_videoCombo, g_videoDevices, g_settings.videoId, g_settings.videoName, L"Selecciona una capturadora...");
-    PopulateDeviceCombo(g_audioCombo, g_audioDevices, g_settings.audioId, g_settings.audioName, L"Selecciona el audio de la capturadora...");
+    PopulateDeviceCombo(g_videoCombo, g_videoDevices, g_settings.videoId, g_settings.videoName, Tr(TextId::SelectCaptureDevice));
+    PopulateDeviceCombo(g_audioCombo, g_audioDevices, g_settings.audioId, g_settings.audioName, Tr(TextId::SelectCaptureAudio));
 
     const bool videoPresent = !g_settings.videoId.empty() && ContainsDevice(g_videoDevices, g_settings.videoId);
     const bool audioPresent = !g_settings.audioId.empty() && ContainsDevice(g_audioDevices, g_settings.audioId);
@@ -1238,29 +1378,29 @@ void RefreshDevices(bool initial) {
     if (!g_settings.videoId.empty()) {
         if (videoPresent) {
             if (initial) {
-                g_videoStatus = L"Capturadora encontrada. Iniciando señal...";
+                g_videoStatus = Tr(TextId::VideoFoundStarting);
                 startVideoNow = true;
             }
         } else {
-            g_videoStatus = L"No se encontró la capturadora guardada: " + (g_settings.videoName.empty() ? L"dispositivo desconocido" : g_settings.videoName);
+            g_videoStatus = std::wstring(Tr(TextId::VideoMissingPrefix)) + (g_settings.videoName.empty() ? Tr(TextId::UnknownDevice) : g_settings.videoName);
             g_nextVideoRetry = GetTickCount64() + 2500;
         }
     } else {
-        g_videoStatus = g_videoDevices.empty() ? L"No se detectaron capturadoras." : L"Selecciona tu capturadora para comenzar.";
+        g_videoStatus = g_videoDevices.empty() ? Tr(TextId::NoCaptureDevices) : Tr(TextId::VideoSelect);
     }
 
     if (!g_settings.audioId.empty()) {
         if (audioPresent) {
             if (initial) {
-                g_audioStatus = L"Audio conectado";
+                g_audioStatus = Tr(TextId::AudioConnected);
                 startAudioNow = true;
             }
         } else {
-            g_audioStatus = L"No se encontró el audio guardado";
+            g_audioStatus = Tr(TextId::AudioMissing);
             g_nextAudioRetry = GetTickCount64() + 2500;
         }
     } else {
-        g_audioStatus = L"Audio sin configurar";
+        g_audioStatus = Tr(TextId::AudioUnconfigured);
     }
 
     // Enumerate capture modes before opening the selected camera. Some UVC
@@ -1292,13 +1432,13 @@ void StartSelectedVideo(bool showErrorIfMissing = true) {
         g_latestFrame = {};
     }
     if (g_settings.videoId.empty()) {
-        g_videoStatus = L"Selecciona una capturadora para comenzar.";
+        g_videoStatus = Tr(TextId::VideoSelect);
     } else if (!ContainsDevice(g_videoDevices, g_settings.videoId)) {
-        g_videoStatus = L"No se encontró la capturadora guardada: " + (g_settings.videoName.empty() ? L"dispositivo desconocido" : g_settings.videoName);
+        g_videoStatus = std::wstring(Tr(TextId::VideoMissingPrefix)) + (g_settings.videoName.empty() ? Tr(TextId::UnknownDevice) : g_settings.videoName);
         if (showErrorIfMissing) MessageBoxW(g_hwnd, g_videoStatus.c_str(), L"PlayView", MB_OK | MB_ICONWARNING);
         g_nextVideoRetry = GetTickCount64() + 3000;
     } else {
-        g_videoStatus = L"Conectando con " + g_settings.videoName + L"...";
+        g_videoStatus = std::wstring(Tr(TextId::VideoConnecting)) + g_settings.videoName + L"...";
         g_videoCapture.Start(g_hwnd, g_settings.videoId, g_settings.width, g_settings.height);
     }
     UpdateStatusText();
@@ -1308,13 +1448,13 @@ void StartSelectedVideo(bool showErrorIfMissing = true) {
 void StartSelectedAudio(bool showErrorIfMissing = false) {
     g_audioCapture.Stop();
     if (g_settings.audioId.empty()) {
-        g_audioStatus = L"Audio sin configurar";
+        g_audioStatus = Tr(TextId::AudioUnconfigured);
     } else if (!ContainsDevice(g_audioDevices, g_settings.audioId)) {
-        g_audioStatus = L"No se encontró el dispositivo de audio guardado";
+        g_audioStatus = Tr(TextId::AudioMissing);
         if (showErrorIfMissing) MessageBoxW(g_hwnd, g_audioStatus.c_str(), L"PlayView", MB_OK | MB_ICONWARNING);
         g_nextAudioRetry = GetTickCount64() + 3000;
     } else {
-        g_audioStatus = L"Audio conectado";
+        g_audioStatus = Tr(TextId::AudioConnected);
         g_audioCapture.Start(g_hwnd, g_settings.audioId);
     }
     UpdateStatusText();
@@ -1485,21 +1625,37 @@ void CreateAppMenu(HWND hwnd) {
     HMENU menu = CreateMenu();
     HMENU file = CreatePopupMenu();
     HMENU view = CreatePopupMenu();
+    HMENU settings = CreatePopupMenu();
+    HMENU language = CreatePopupMenu();
     HMENU help = CreatePopupMenu();
+
     AppendMenuW(file, MF_STRING | (g_settings.showToolbar ? MF_CHECKED : MF_UNCHECKED),
-        IDM_SHOW_TOOLBAR, L"Mostrar barra de opciones");
+        IDM_SHOW_TOOLBAR, Tr(TextId::ShowToolbar));
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(file, MF_STRING, IDM_EXIT, L"Salir");
-    AppendMenuW(view, MF_STRING, IDM_VIEW_WINDOW, L"Ventana");
-    AppendMenuW(view, MF_STRING, IDM_VIEW_FULLSCREEN, L"Pantalla completa\tF11");
+    AppendMenuW(file, MF_STRING, IDM_EXIT, Tr(TextId::Exit));
+
+    AppendMenuW(view, MF_STRING, IDM_VIEW_WINDOW, Tr(TextId::Windowed));
+    AppendMenuW(view, MF_STRING, IDM_VIEW_FULLSCREEN, Tr(TextId::Fullscreen));
     AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(view, MF_STRING, IDM_VIEW_PIP, L"Picture in Picture\tCtrl+Mayús+P");
-    AppendMenuW(view, MF_STRING | (g_pipAlwaysOnTop ? MF_CHECKED : MF_UNCHECKED), IDM_PIP_TOPMOST, L"PiP siempre visible");
-    AppendMenuW(help, MF_STRING, IDM_ABOUT, L"Acerca de PlayView");
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"Archivo");
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"Ver");
+    AppendMenuW(view, MF_STRING, IDM_VIEW_PIP, Tr(TextId::PipMenu));
+    AppendMenuW(view, MF_STRING | (g_pipAlwaysOnTop ? MF_CHECKED : MF_UNCHECKED),
+        IDM_PIP_TOPMOST, Tr(TextId::PipAlwaysOnTop));
+
+    AppendMenuW(language, MF_STRING | (g_languagePreference == LanguagePreference::Automatic ? MF_CHECKED : MF_UNCHECKED),
+        IDM_LANGUAGE_AUTOMATIC, Tr(TextId::LanguageAutomatic));
+    AppendMenuW(language, MF_STRING | (g_languagePreference == LanguagePreference::Spanish ? MF_CHECKED : MF_UNCHECKED),
+        IDM_LANGUAGE_SPANISH, Tr(TextId::LanguageSpanish));
+    AppendMenuW(language, MF_STRING | (g_languagePreference == LanguagePreference::English ? MF_CHECKED : MF_UNCHECKED),
+        IDM_LANGUAGE_ENGLISH, Tr(TextId::LanguageEnglish));
+
+    AppendMenuW(settings, MF_POPUP, reinterpret_cast<UINT_PTR>(language), Tr(TextId::LanguageMenu));
+    AppendMenuW(help, MF_STRING, IDM_ABOUT, Tr(TextId::About));
+
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(file), Tr(TextId::FileMenu));
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view), Tr(TextId::ViewMenu));
     RebuildProfilesMenu(menu);
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(help), L"Ayuda");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(settings), Tr(TextId::SettingsMenu));
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(help), Tr(TextId::HelpMenu));
 
     HMENU oldMenu = g_appMenu;
     g_appMenu = menu;
@@ -1510,6 +1666,48 @@ void CreateAppMenu(HWND hwnd) {
 
 void RequestMenuRebuild() {
     if (g_hwnd && IsWindow(g_hwnd)) PostMessageW(g_hwnd, WM_APP_REBUILD_MENU, 0, 0);
+}
+
+void RefreshLocalizedRuntimeStatus() {
+    if (g_settings.videoId.empty()) {
+        g_videoStatus = g_videoDevices.empty() ? Tr(TextId::NoCaptureDevices) : Tr(TextId::VideoSelect);
+    } else if (!ContainsDevice(g_videoDevices, g_settings.videoId)) {
+        g_videoStatus = std::wstring(Tr(TextId::VideoMissingPrefix)) +
+            (g_settings.videoName.empty() ? Tr(TextId::UnknownDevice) : g_settings.videoName);
+    } else if (g_videoCapture.IsRunning()) {
+        g_videoStatus = g_videoHasFrame.load() ? Tr(TextId::VideoActive) : Tr(TextId::VideoFoundStarting);
+    } else {
+        g_videoStatus = Tr(TextId::VideoSelect);
+    }
+
+    if (g_settings.audioId.empty()) g_audioStatus = Tr(TextId::AudioUnconfigured);
+    else if (ContainsDevice(g_audioDevices, g_settings.audioId) && g_audioCapture.IsRunning())
+        g_audioStatus = Tr(TextId::AudioConnected);
+    else g_audioStatus = Tr(TextId::AudioMissing);
+    UpdateStatusText();
+}
+
+void ApplyLanguageChange(LanguagePreference preference) {
+    g_languagePreference = preference;
+    g_uiLanguage = ResolveUiLanguage(g_languagePreference);
+    SaveLanguagePreference();
+    if (!g_hwnd || !IsWindow(g_hwnd)) return;
+
+    PopulateDeviceCombo(g_videoCombo, g_videoDevices, g_settings.videoId, g_settings.videoName, Tr(TextId::SelectCaptureDevice));
+    PopulateDeviceCombo(g_audioCombo, g_audioDevices, g_settings.audioId, g_settings.audioName, Tr(TextId::SelectCaptureAudio));
+    PopulateResolutionCombo();
+    if (HWND reload = GetDlgItem(g_hwnd, IDC_RELOAD)) SetWindowTextW(reload, Tr(TextId::ReloadButton));
+    if (HWND pip = GetDlgItem(g_hwnd, IDC_PIP)) SetWindowTextW(pip, Tr(TextId::PipButton));
+    if (HWND sync = GetDlgItem(g_hwnd, IDC_SYNC)) SetWindowTextW(sync, Tr(TextId::ResyncButton));
+    if (g_muteButton) SetWindowTextW(g_muteButton, g_settings.muted ? Tr(TextId::UnmuteButton) : Tr(TextId::MuteButton));
+    if (!g_activeProfileName.empty())
+        SetWindowTextW(g_hwnd, (std::wstring(Tr(TextId::WindowTitleProfile)) + g_activeProfileName).c_str());
+    else SetWindowTextW(g_hwnd, L"PlayView");
+    RefreshLocalizedRuntimeStatus();
+    CreateAppMenu(g_hwnd);
+    UpdateOverlayVisibility(true);
+    InvalidateVideoSurface(g_hwnd);
+    if (g_pipHwnd && IsWindow(g_pipHwnd)) InvalidateVideoSurface(g_pipHwnd);
 }
 
 void LayoutControls(int width, int /*height*/) {
@@ -1689,10 +1887,10 @@ void DrawPreview(HDC target, HWND window, PaintBuffer& buffer, bool compact = fa
         const int audioComboW = std::max(150, width - audioComboX - 315);
         const int resLabelX = audioComboX + audioComboW + 10;
 
-        drawLabel(L"Capturadora", RECT{ 12, 8, 96, 36 });
-        drawLabel(L"Audio", RECT{ audioLabelX, 8, audioLabelX + 46, 36 });
-        drawLabel(L"Resolución", RECT{ resLabelX, 8, resLabelX + 74, 36 });
-        drawLabel(L"Volumen: " + std::to_wstring(g_settings.volume) + L"%",
+        drawLabel(Tr(TextId::CaptureDeviceLabel), RECT{ 12, 8, 96, 36 });
+        drawLabel(Tr(TextId::AudioLabel), RECT{ audioLabelX, 8, audioLabelX + 46, 36 });
+        drawLabel(Tr(TextId::ResolutionLabel), RECT{ resLabelX, 8, resLabelX + 74, 36 });
+        drawLabel(std::wstring(Tr(TextId::VolumeLabel)) + std::to_wstring(g_settings.volume) + L"%",
             RECT{ 12, 48, 124, 80 });
         if (!g_statusText.empty()) {
             drawLabel(g_statusText, RECT{ 600, 48, std::max(720, width - 12), 80 });
@@ -1997,8 +2195,8 @@ LRESULT CALLBACK PipWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
         POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         if (lParam == -1) GetCursorPos(&point);
         HMENU context = CreatePopupMenu();
-        AppendMenuW(context, MF_STRING, IDM_PIP_CLOSE, L"Ocultar Picture in Picture");
-        AppendMenuW(context, MF_STRING | (g_pipAlwaysOnTop ? MF_CHECKED : MF_UNCHECKED), IDM_PIP_TOPMOST, L"Siempre visible");
+        AppendMenuW(context, MF_STRING, IDM_PIP_CLOSE, Tr(TextId::HidePip));
+        AppendMenuW(context, MF_STRING | (g_pipAlwaysOnTop ? MF_CHECKED : MF_UNCHECKED), IDM_PIP_TOPMOST, Tr(TextId::AlwaysOnTop));
         TrackPopupMenu(context, TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, nullptr);
         DestroyMenu(context);
         return 0;
@@ -2038,7 +2236,7 @@ void TogglePictureInPicture() {
             WS_POPUP | WS_THICKFRAME | WS_VISIBLE, 120, 120, 520, 310,
             nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
         if (!g_pipHwnd) {
-            MessageBoxW(g_hwnd, L"No se pudo crear la ventana Picture in Picture.", L"PlayView", MB_OK | MB_ICONERROR);
+            MessageBoxW(g_hwnd, Tr(TextId::PipCreateFailed), L"PlayView", MB_OK | MB_ICONERROR);
             return;
         }
     }
@@ -2066,8 +2264,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         SendMessageW(g_videoCombo, CB_SETMINVISIBLE, 8, 0);
         SendMessageW(g_audioCombo, CB_SETMINVISIBLE, 8, 0);
         g_resolutionCombo = AddControl(0, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 0, 0, 0, IDC_RESOLUTION);
-        AddControl(0, L"BUTTON", L"Recargar (F5)", BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 0, 0, IDC_RELOAD);
-        AddControl(0, L"BUTTON", L"PiP", BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 0, 0, IDC_PIP);
+        AddControl(0, L"BUTTON", Tr(TextId::ReloadButton), BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 0, 0, IDC_RELOAD);
+        AddControl(0, L"BUTTON", Tr(TextId::PipButton), BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 0, 0, IDC_PIP);
         g_volumeSlider = AddControl(0, TRACKBAR_CLASSW, L"", TBS_HORZ | WS_TABSTOP, 0, 0, 0, 0, IDC_VOLUME);
         if (g_volumeSlider) SetWindowSubclass(g_volumeSlider, VolumeSliderSubclass, 1, 0);
         g_volumeTooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
@@ -2085,8 +2283,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         SendMessageW(g_volumeSlider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
         SendMessageW(g_volumeSlider, TBM_SETPOS, TRUE, g_settings.volume);
         
-        g_muteButton = AddControl(0, L"BUTTON", g_settings.muted ? L"Activar" : L"Silenciar", BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 0, 0, IDC_MUTE);
-        AddControl(0, L"BUTTON", L"Resincronizar", BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 0, 0, IDC_SYNC);
+        g_muteButton = AddControl(0, L"BUTTON", g_settings.muted ? Tr(TextId::UnmuteButton) : Tr(TextId::MuteButton), BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 0, 0, IDC_MUTE);
+        AddControl(0, L"BUTTON", Tr(TextId::ResyncButton), BS_PUSHBUTTON | WS_TABSTOP, 0, 0, 0, 0, IDC_SYNC);
         CreateAppMenu(hwnd);
         RefreshDevices(true);
         SetTimer(hwnd, TIMER_RECONNECT, 2500, nullptr);
@@ -2126,7 +2324,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             ApplyLoadedWindowPreferences();
             SetWindowTextW(g_hwnd, L"PlayView");
             SendMessageW(g_volumeSlider, TBM_SETPOS, TRUE, g_settings.volume);
-            SetWindowTextW(g_muteButton, g_settings.muted ? L"Activar" : L"Silenciar");
+            SetWindowTextW(g_muteButton, g_settings.muted ? Tr(TextId::UnmuteButton) : Tr(TextId::MuteButton));
             InvalidateVideoSurface(hwnd);
             RefreshDevices(true);
             return 0;
@@ -2139,8 +2337,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         if (commandId >= IDM_PROFILE_SHORTCUT_BASE && commandId < IDM_PROFILE_SHORTCUT_BASE + ID_PROFILE_MENU_LIMIT) {
             const size_t index = commandId - IDM_PROFILE_SHORTCUT_BASE;
             if (index < g_profileMenuEntries.size()) {
-                if (CreateProfileShortcut(g_profileMenuEntries[index])) MessageBoxW(hwnd, L"Acceso directo creado en el escritorio.", L"PlayView", MB_OK | MB_ICONINFORMATION);
-                else MessageBoxW(hwnd, L"No se pudo crear el acceso directo.", L"PlayView", MB_OK | MB_ICONWARNING);
+                if (CreateProfileShortcut(g_profileMenuEntries[index])) MessageBoxW(hwnd, Tr(TextId::ShortcutCreated), L"PlayView", MB_OK | MB_ICONINFORMATION);
+                else MessageBoxW(hwnd, Tr(TextId::ShortcutCreationFailed), L"PlayView", MB_OK | MB_ICONWARNING);
             }
             return 0;
         }
@@ -2173,13 +2371,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             RefreshDevices(false);
             StartSelectedVideo(false);
             StartSelectedAudio(false);
-            g_videoStatus = L"Capturas reiniciadas para resincronización";
+            g_videoStatus = Tr(TextId::CapturesResynced);
             UpdateStatusText();
             return 0;
         case IDC_MUTE:
             g_settings.muted = !g_settings.muted;
             g_muted.store(g_settings.muted);
-            SetWindowTextW(g_muteButton, g_settings.muted ? L"Activar" : L"Silenciar");
+            SetWindowTextW(g_muteButton, g_settings.muted ? Tr(TextId::UnmuteButton) : Tr(TextId::MuteButton));
             SaveSettings();
             return 0;
         case IDC_PIP: TogglePictureInPicture(); return 0;
@@ -2195,12 +2393,26 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case IDM_VIEW_FULLSCREEN: SetWindowMode(g_windowMode == 2 ? 0 : 2); return 0;
         case IDM_EXIT: PostMessageW(hwnd, WM_CLOSE, 0, 0); return 0;
         case IDM_ABOUT:
-            MessageBoxW(hwnd, L"PlayView 1.0.0\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation.",
-                L"Acerca de PlayView", MB_OK | MB_ICONINFORMATION);
+            MessageBoxW(hwnd, Tr(TextId::AboutBody), Tr(TextId::AboutTitle), MB_OK | MB_ICONINFORMATION);
+            return 0;
+        case IDM_LANGUAGE_AUTOMATIC:
+            ApplyLanguageChange(LanguagePreference::Automatic);
+            return 0;
+        case IDM_LANGUAGE_SPANISH:
+            ApplyLanguageChange(LanguagePreference::Spanish);
+            return 0;
+        case IDM_LANGUAGE_ENGLISH:
+            ApplyLanguageChange(LanguagePreference::English);
             return 0;
         }
         break;
     }
+    case WM_SETTINGCHANGE:
+        if (g_languagePreference == LanguagePreference::Automatic &&
+            ResolveUiLanguage(LanguagePreference::Automatic) != g_uiLanguage) {
+            ApplyLanguageChange(LanguagePreference::Automatic);
+        }
+        break;
     case WM_HSCROLL:
         if (reinterpret_cast<HWND>(lParam) == g_volumeSlider) {
             g_settings.volume = static_cast<int>(SendMessageW(g_volumeSlider, TBM_GETPOS, 0, 0));
@@ -2229,11 +2441,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         CreateAppMenu(hwnd);
         return 0;
     case WM_APP_VIDEO_READY:
-        g_videoStatus = L"Captura activa";
+        g_videoStatus = Tr(TextId::VideoActive);
         UpdateStatusText();
         return 0;
     case WM_APP_VIDEO_LOST:
-        g_videoStatus = L"Se perdió la señal o la capturadora se desconectó. Buscando el mismo dispositivo...";
+        g_videoStatus = Tr(TextId::VideoSignalLostRetry);
         g_videoHasFrame.store(false);
         g_nextVideoRetry = GetTickCount64() + 2500;
         {
@@ -2245,7 +2457,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) InvalidateVideoSurface(g_pipHwnd);
         return 0;
     case WM_APP_AUDIO_LOST:
-        g_audioStatus = L"Audio desconectado. Buscando el mismo dispositivo...";
+        g_audioStatus = Tr(TextId::AudioDisconnectedRetry);
         g_nextAudioRetry = GetTickCount64() + 2500;
         UpdateStatusText();
         return 0;
@@ -2260,36 +2472,36 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 g_videoStartTick > 0 && now - g_videoStartTick > 5000;
             const bool framesStopped = g_videoCapture.IsRunning() && g_videoHasFrame.load() &&
                 g_lastVideoFrameTick.load() > 0 && now - g_lastVideoFrameTick.load() > 5000;
-            if ((waitingForFirstFrame && g_videoStatus.find(L"Esperando fotogramas") == std::wstring::npos) ||
-                (framesStopped && g_videoStatus.find(L"dejó de enviar fotogramas") == std::wstring::npos)) {
+            if ((waitingForFirstFrame && g_videoStatus.find(Tr(TextId::VideoWaitingFrames)) == std::wstring::npos) ||
+                (framesStopped && g_videoStatus.find(Tr(TextId::VideoStoppedFrames)) == std::wstring::npos)) {
                 g_videoStatus = waitingForFirstFrame
-                    ? L"Esperando fotogramas. Comprueba la entrada HDMI de la capturadora."
-                    : L"La capturadora dejó de enviar fotogramas. Pulsa F5 para recargar.";
+                    ? Tr(TextId::VideoWaitingFrames)
+                    : Tr(TextId::VideoStoppedFrames);
                 UpdateStatusText();
                 InvalidateVideoSurface(hwnd);
             }
             if (!g_settings.videoId.empty() && !g_videoCapture.IsRunning() && now >= g_nextVideoRetry) {
                 g_videoDevices = EnumerateDevices(true);
-                PopulateDeviceCombo(g_videoCombo, g_videoDevices, g_settings.videoId, g_settings.videoName, L"Selecciona una capturadora...");
+                PopulateDeviceCombo(g_videoCombo, g_videoDevices, g_settings.videoId, g_settings.videoName, Tr(TextId::SelectCaptureDevice));
                 if (ContainsDevice(g_videoDevices, g_settings.videoId)) {
-                    g_videoStatus = L"Capturadora recuperada. Reconectando...";
+                    g_videoStatus = Tr(TextId::VideoReconnecting);
                     g_videoStartTick = now;
                     g_videoHasFrame.store(false);
                     g_videoCapture.Start(hwnd, g_settings.videoId, g_settings.width, g_settings.height);
                 } else {
-                    g_videoStatus = L"No se encontró la capturadora guardada: " + (g_settings.videoName.empty() ? L"dispositivo desconocido" : g_settings.videoName);
+                    g_videoStatus = std::wstring(Tr(TextId::VideoMissingPrefix)) + (g_settings.videoName.empty() ? Tr(TextId::UnknownDevice) : g_settings.videoName);
                     g_nextVideoRetry = now + 4000;
                 }
                 UpdateStatusText();
             }
             if (!g_settings.audioId.empty() && !g_audioCapture.IsRunning() && now >= g_nextAudioRetry) {
                 g_audioDevices = EnumerateDevices(false);
-                PopulateDeviceCombo(g_audioCombo, g_audioDevices, g_settings.audioId, g_settings.audioName, L"Selecciona el audio de la capturadora...");
+                PopulateDeviceCombo(g_audioCombo, g_audioDevices, g_settings.audioId, g_settings.audioName, Tr(TextId::SelectCaptureAudio));
                 if (ContainsDevice(g_audioDevices, g_settings.audioId)) {
                     g_audioCapture.Start(hwnd, g_settings.audioId);
-                    g_audioStatus = L"Audio reconectado";
+                    g_audioStatus = Tr(TextId::AudioConnected);
                 } else {
-                    g_audioStatus = L"No se encontró el audio guardado";
+                    g_audioStatus = Tr(TextId::AudioMissing);
                     g_nextAudioRetry = now + 4000;
                 }
                 UpdateStatusText();
@@ -2310,11 +2522,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         if (lParam == -1) GetCursorPos(&point);
         HMENU context = CreatePopupMenu();
-        AppendMenuW(context, MF_STRING, IDM_VIEW_WINDOW, L"Ventana");
-        AppendMenuW(context, MF_STRING, IDM_VIEW_FULLSCREEN, L"Pantalla completa");
+        HMENU settings = CreatePopupMenu();
+        HMENU language = CreatePopupMenu();
+        AppendMenuW(context, MF_STRING, IDM_VIEW_WINDOW, Tr(TextId::Windowed));
+        AppendMenuW(context, MF_STRING, IDM_VIEW_FULLSCREEN, Tr(TextId::Fullscreen));
         AppendMenuW(context, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(context, MF_STRING, IDM_VIEW_PIP, L"Picture in Picture");
-        AppendMenuW(context, MF_STRING, IDM_EXIT, L"Salir");
+        AppendMenuW(context, MF_STRING, IDM_VIEW_PIP, Tr(TextId::PipMenu));
+        AppendMenuW(language, MF_STRING | (g_languagePreference == LanguagePreference::Automatic ? MF_CHECKED : MF_UNCHECKED),
+            IDM_LANGUAGE_AUTOMATIC, Tr(TextId::LanguageAutomatic));
+        AppendMenuW(language, MF_STRING | (g_languagePreference == LanguagePreference::Spanish ? MF_CHECKED : MF_UNCHECKED),
+            IDM_LANGUAGE_SPANISH, Tr(TextId::LanguageSpanish));
+        AppendMenuW(language, MF_STRING | (g_languagePreference == LanguagePreference::English ? MF_CHECKED : MF_UNCHECKED),
+            IDM_LANGUAGE_ENGLISH, Tr(TextId::LanguageEnglish));
+        AppendMenuW(settings, MF_POPUP, reinterpret_cast<UINT_PTR>(language), Tr(TextId::LanguageMenu));
+        AppendMenuW(context, MF_POPUP, reinterpret_cast<UINT_PTR>(settings), Tr(TextId::SettingsMenu));
+        AppendMenuW(context, MF_STRING, IDM_EXIT, Tr(TextId::Exit));
         TrackPopupMenu(context, TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, nullptr);
         DestroyMenu(context);
         return 0;
@@ -2349,6 +2571,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     InitializePaths();
+    LoadLanguagePreference();
     LoadSettings();
     int argumentCount = 0;
     LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
@@ -2373,7 +2596,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     const HRESULT comHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     HRESULT mfHr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
     if (FAILED(mfHr)) {
-        MessageBoxW(nullptr, L"No se pudo iniciar Windows Media Foundation. Comprueba que Windows esté actualizado.",
+        MessageBoxW(nullptr, Tr(TextId::MediaFoundationStartupError),
             L"PlayView", MB_OK | MB_ICONERROR);
         if (SUCCEEDED(comHr)) CoUninitialize();
         return 1;
@@ -2418,7 +2641,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         return 1;
     }
     g_windowMode = 0;
-    if (!g_activeProfileName.empty()) SetWindowTextW(hwnd, (L"PlayView | " + g_activeProfileName).c_str());
+    if (!g_activeProfileName.empty()) SetWindowTextW(hwnd, (std::wstring(Tr(TextId::WindowTitleProfile)) + g_activeProfileName).c_str());
 
     // WM_SIZE can run during CreateWindowEx before saved placement is applied.
     // Restore the persisted flag here so that the initial size notifications
