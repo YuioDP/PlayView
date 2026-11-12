@@ -256,3 +256,12 @@ PlayView no utiliza Electron ni requiere tener instalado VLC, FFmpeg u otro repr
 ---
 
 **PlayView 1.2.0** · Un monitor ligero de capturadoras para Windows.
+
+
+### Rendering and responsiveness
+
+The windowed renderer submits frames without blocking the UI thread at vertical blank. Windows Desktop Window Manager (DWM) composes the flip-model swap chain at the display refresh rate. The About window is modeless, so opening it does not disable the main application. The volume tooltip is explicitly dismissed whenever the options bar hides or PlayView loses activation.
+
+### Renderizado y respuesta de la interfaz
+
+El renderizador en modo ventana envía los fotogramas sin bloquear el hilo de interfaz esperando al siguiente refresco vertical. El Administrador de ventanas del escritorio de Windows (DWM) compone la cadena de intercambio flip-model según la frecuencia de la pantalla. La ventana Acerca de no es modal, por lo que abrirla no deshabilita la aplicación principal. La ayuda emergente del volumen se cierra expresamente cuando se oculta la barra de opciones o PlayView pierde la activación.

@@ -57,6 +57,7 @@ namespace {
 constexpr wchar_t kAppName[] = L"PlayView";
 constexpr wchar_t kWindowClass[] = L"PlayViewMainWindow";
 constexpr wchar_t kPipWindowClass[] = L"PlayViewPictureInPictureWindow";
+constexpr wchar_t kAboutWindowClass[] = L"PlayViewAboutWindow";
 constexpr UINT WM_APP_FRAME = WM_APP + 1;
 constexpr UINT WM_APP_VIDEO_READY = WM_APP + 2;
 constexpr UINT WM_APP_VIDEO_LOST = WM_APP + 3;
@@ -95,6 +96,7 @@ constexpr int IDM_LANGUAGE_AUTOMATIC = 2700;
 constexpr int IDM_LANGUAGE_SPANISH = 2701;
 constexpr int IDM_LANGUAGE_ENGLISH = 2702;
 constexpr int IDM_SHOW_PERFORMANCE_STATS = 2703;
+constexpr int IDC_ABOUT_OK = 2800;
 constexpr int ID_PROFILE_MENU_LIMIT = 100;
 
 enum class LanguagePreference : int { Automatic = 0, Spanish = 1, English = 2 };
@@ -308,6 +310,7 @@ uint64_t g_compatibilityLastPresentedSequence = 0;
 
 HWND g_hwnd = nullptr;
 HWND g_pipHwnd = nullptr;
+HWND g_aboutHwnd = nullptr;
 HWND g_videoCombo = nullptr;
 HWND g_audioCombo = nullptr;
 HWND g_resolutionCombo = nullptr;
@@ -1571,14 +1574,22 @@ void UpdateVolumeTooltip() {
 }
 
 void HideVolumeTooltip() {
-    if (!g_volumeTooltip || !g_volumeTooltipVisible || !g_volumeSlider) return;
+    if (!g_volumeTooltip) {
+        g_volumeTooltipVisible = false;
+        return;
+    }
     TOOLINFOW tool{};
     tool.cbSize = sizeof(tool);
     tool.uFlags = TTF_IDISHWND | TTF_TRACK | TTF_ABSOLUTE;
     tool.hwnd = g_hwnd;
     tool.uId = reinterpret_cast<UINT_PTR>(g_volumeSlider);
     tool.lpszText = const_cast<LPWSTR>(g_volumeTooltipText.c_str());
+    // TTM_TRACKACTIVATE(FALSE) normally closes a tracking tooltip. TTM_POP
+    // and SW_HIDE are also applied because hiding the parent toolbar does not
+    // necessarily generate WM_MOUSELEAVE for its child trackbar.
     SendMessageW(g_volumeTooltip, TTM_TRACKACTIVATE, FALSE, reinterpret_cast<LPARAM>(&tool));
+    SendMessageW(g_volumeTooltip, TTM_POP, 0, 0);
+    ShowWindow(g_volumeTooltip, SW_HIDE);
     g_volumeTooltipVisible = false;
 }
 
@@ -1595,6 +1606,9 @@ LRESULT CALLBACK VolumeSliderSubclass(HWND hwnd, UINT message, WPARAM wParam, LP
         break;
     }
     case WM_MOUSELEAVE:
+    case WM_CANCELMODE:
+    case WM_CAPTURECHANGED:
+    case WM_KILLFOCUS:
         HideVolumeTooltip();
         break;
     case WM_NCDESTROY:
@@ -2128,7 +2142,11 @@ public:
             return false;
         }
 
-        const HRESULT presentHr = t.swapChain->Present(compact ? 0 : 1, 0);
+        // Do not block the UI thread waiting for vertical blank in windowed mode.
+        // DWM composes flip-model windows at the display refresh rate; Present(0)
+        // lets each new capture frame enter that composition queue instead of
+        // throttling WM_PAINT to every second refresh on some desktop drivers.
+        const HRESULT presentHr = t.swapChain->Present(0, 0);
         if (SUCCEEDED(presentHr) && lastUploadedSequence_ > lastCountedSequence_) {
             g_renderFramesInterval.fetch_add(1, std::memory_order_relaxed);
             lastCountedSequence_ = lastUploadedSequence_;
@@ -2735,6 +2753,7 @@ bool IsAnyToolbarComboDropped() {
 
 void ShowToolbarControls(bool visible) {
     if (!g_hwnd) return;
+    if (!visible) HideVolumeTooltip();
     const int ids[] = {
         IDC_VIDEO_DEVICE, IDC_AUDIO_DEVICE, IDC_RESOLUTION, IDC_RELOAD,
         IDC_VOLUME, IDC_MUTE, IDC_SYNC, IDC_PIP
@@ -2769,18 +2788,19 @@ void UpdateOverlayVisibility(bool force) {
         DrawMenuBar(g_hwnd);
     }
 
-    // The menu option controls only normal windowed mode. Checked means the
-    // toolbar stays fixed. Fullscreen always uses top-edge hover, regardless
-    // of the saved windowed-mode preference.
-    const bool useHoverReveal = (g_windowMode == 2) || !g_settings.showToolbar;
-    if (!useHoverReveal) {
+    // Windowed mode:
+    //   showToolbar=true  => fixed toolbar, never auto-hide.
+    //   showToolbar=false => hide by default, reveal only over the top zone.
+    // Fullscreen always uses hover reveal and ignores the saved preference.
+    const bool fixedWindowedToolbar = (g_windowMode == 0 && g_settings.showToolbar);
+    if (fixedWindowedToolbar) {
         g_suppressToolbarRevealUntilLeave = false;
         KillTimer(g_hwnd, TIMER_OVERLAY);
         if (!g_overlayVisible || force) ShowToolbarControls(true);
         return;
     }
 
-    SetTimer(g_hwnd, TIMER_OVERLAY, 70, nullptr);
+    SetTimer(g_hwnd, TIMER_OVERLAY, 50, nullptr);
     bool inTopZone = false;
     POINT cursor{};
     if (GetCursorPos(&cursor)) {
@@ -2788,18 +2808,21 @@ void UpdateOverlayVisibility(bool force) {
         if (ScreenToClient(g_hwnd, &clientCursor)) {
             RECT client{};
             GetClientRect(g_hwnd, &client);
+            constexpr LONG kToolbarRevealHeight = 104;
             inTopZone = clientCursor.x >= 0 && clientCursor.x < client.right &&
-                clientCursor.y >= 0 && clientCursor.y <= 104;
+                clientCursor.y >= 0 && clientCursor.y <= kToolbarRevealHeight;
         }
     }
 
-    // After disabling the fixed toolbar, do not immediately reveal it just
-    // because the pointer is still over the menu bar. Require one leave/re-enter.
+    // After the user unchecks the fixed-toolbar option, don't reveal it just
+    // because the pointer remains over the File menu. Clear suppression only
+    // after the pointer has left the toolbar's client-area reveal zone.
     if (!inTopZone) g_suppressToolbarRevealUntilLeave = false;
-    // Keep the bar open while a combo's native popup list is active, including
-    // the lower entries that extend beyond the toolbar's visible top area.
+
+    // A dropped combo must keep the controls visible so the lower entries of
+    // the resolution list remain selectable even outside the top reveal zone.
     const bool comboIsOpen = IsAnyToolbarComboDropped();
-    const bool shouldShow = (inTopZone && !g_suppressToolbarRevealUntilLeave) || comboIsOpen;
+    const bool shouldShow = comboIsOpen || (inTopZone && !g_suppressToolbarRevealUntilLeave);
     if (force || shouldShow != g_overlayVisible) ShowToolbarControls(shouldShow);
 }
 
@@ -3059,6 +3082,79 @@ void TogglePictureInPicture() {
     UpdateWindow(g_pipHwnd);
 }
 
+LRESULT CALLBACK AboutWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE: {
+        HWND body = CreateWindowExW(0, L"STATIC", Tr(TextId::AboutBody),
+            WS_CHILD | WS_VISIBLE | SS_CENTER | SS_NOPREFIX,
+            20, 22, 380, 92, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+        HWND ok = CreateWindowExW(0, L"BUTTON", L"OK",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            165, 128, 90, 30, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_ABOUT_OK)),
+            GetModuleHandleW(nullptr), nullptr);
+        if (body) SetControlFont(body);
+        if (ok) SetControlFont(ok);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_ABOUT_OK || LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL) {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE || wParam == VK_RETURN) {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_NCDESTROY:
+        if (g_aboutHwnd == hwnd) g_aboutHwnd = nullptr;
+        break;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+void CreateAboutWindow() {
+    if (g_aboutHwnd && IsWindow(g_aboutHwnd)) {
+        ShowWindow(g_aboutHwnd, SW_SHOWNOACTIVATE);
+        SetWindowPos(g_aboutHwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        SetForegroundWindow(g_aboutHwnd);
+        SetFocus(g_aboutHwnd);
+        return;
+    }
+
+    RECT owner{};
+    if (g_hwnd && IsWindow(g_hwnd)) GetWindowRect(g_hwnd, &owner);
+    else SystemParametersInfoW(SPI_GETWORKAREA, 0, &owner, 0);
+    constexpr int width = 420;
+    constexpr int height = 205;
+    const int x = owner.left + std::max(0L, (owner.right - owner.left - width) / 2);
+    const int y = owner.top + std::max(0L, (owner.bottom - owner.top - height) / 2);
+
+    // This is intentionally modeless. It remains above the owned main window
+    // and PiP, but does not disable the rest of PlayView while it is open.
+    g_aboutHwnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST | WS_EX_CONTROLPARENT,
+        kAboutWindowClass, Tr(TextId::AboutTitle),
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        x, y, width, height, g_hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!g_aboutHwnd) {
+        Log(L"Could not create the modeless About window; GetLastError=" +
+            std::to_wstring(GetLastError()));
+        return;
+    }
+    ShowWindow(g_aboutHwnd, SW_SHOW);
+    UpdateWindow(g_aboutHwnd);
+    SetWindowPos(g_aboutHwnd, HWND_TOPMOST, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    SetForegroundWindow(g_aboutHwnd);
+    SetFocus(g_aboutHwnd);
+}
+
 void TogglePipTopmost() {
     g_pipAlwaysOnTop = !g_pipAlwaysOnTop;
     if (g_pipHwnd) SetWindowPos(g_pipHwnd, g_pipAlwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
@@ -3212,15 +3308,23 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             return 0;
         case IDM_SHOW_TOOLBAR:
             g_settings.showToolbar = !g_settings.showToolbar;
-            if (g_windowMode == 0 && !g_settings.showToolbar) {
-                // Don't let the still-open menu cursor immediately reveal it again.
-                g_suppressToolbarRevealUntilLeave = true;
-                ShowToolbarControls(false);
-                SetTimer(hwnd, TIMER_OVERLAY, 70, nullptr);
+            if (g_windowMode == 0) {
+                if (g_settings.showToolbar) {
+                    // Checked in windowed mode means permanently visible.
+                    g_suppressToolbarRevealUntilLeave = false;
+                    ShowToolbarControls(true);
+                } else {
+                    // Unchecked means reveal only on hover, after the pointer
+                    // has left the menu/toolbar zone and entered it again.
+                    g_suppressToolbarRevealUntilLeave = true;
+                    ShowToolbarControls(false);
+                    SetTimer(hwnd, TIMER_OVERLAY, 50, nullptr);
+                }
             } else {
+                // Fullscreen behavior is independent of this saved setting.
                 g_suppressToolbarRevealUntilLeave = false;
+                UpdateOverlayVisibility(true);
             }
-            UpdateOverlayVisibility(true);
             SaveSettings();
             RequestMenuRebuild();
             return 0;
@@ -3228,7 +3332,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case IDM_VIEW_FULLSCREEN: SetWindowMode(g_windowMode == 2 ? 0 : 2); return 0;
         case IDM_EXIT: PostMessageW(hwnd, WM_CLOSE, 0, 0); return 0;
         case IDM_ABOUT:
-            MessageBoxW(hwnd, Tr(TextId::AboutBody), Tr(TextId::AboutTitle), MB_OK | MB_ICONINFORMATION);
+            CreateAboutWindow();
             return 0;
         case IDM_LANGUAGE_AUTOMATIC:
             ApplyLanguageChange(LanguagePreference::Automatic);
@@ -3242,6 +3346,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         }
         break;
     }
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) == WA_INACTIVE) HideVolumeTooltip();
+        break;
+    case WM_CANCELMODE:
+    case WM_CAPTURECHANGED:
+        HideVolumeTooltip();
+        break;
     case WM_SETTINGCHANGE:
         if (g_languagePreference == LanguagePreference::Automatic &&
             ResolveUiLanguage(LanguagePreference::Automatic) != g_uiLanguage) {
@@ -3420,6 +3531,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_CLOSE:
         KillTimer(hwnd, TIMER_RECONNECT);
         KillTimer(hwnd, TIMER_STATS);
+        if (g_aboutHwnd && IsWindow(g_aboutHwnd)) DestroyWindow(g_aboutHwnd);
         if (g_pipHwnd) DestroyWindow(g_pipHwnd);
         g_videoCapture.Stop();
         g_audioCapture.Stop();
@@ -3431,6 +3543,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         KillTimer(hwnd, TIMER_OVERLAY);
         KillTimer(hwnd, TIMER_RECONNECT);
         KillTimer(hwnd, TIMER_STATS);
+        if (g_aboutHwnd && IsWindow(g_aboutHwnd)) DestroyWindow(g_aboutHwnd);
         if (g_pipHwnd && IsWindow(g_pipHwnd)) DestroyWindow(g_pipHwnd);
         g_videoCapture.Stop();
         g_audioCapture.Stop();
@@ -3497,6 +3610,16 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     pipClass.lpszClassName = kPipWindowClass;
     RegisterClassExW(&pipClass);
 
+    WNDCLASSEXW aboutClass{};
+    aboutClass.cbSize = sizeof(aboutClass);
+    aboutClass.lpfnWndProc = AboutWindowProc;
+    aboutClass.hInstance = instance;
+    aboutClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP_ICON));
+    aboutClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    aboutClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+    aboutClass.lpszClassName = kAboutWindowClass;
+    RegisterClassExW(&aboutClass);
+
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.style = 0;
@@ -3561,6 +3684,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        // The About window is modeless, so route its keyboard navigation
+        // through the dialog manager without blocking the main message loop.
+        if (g_aboutHwnd && IsDialogMessageW(g_aboutHwnd, &message)) continue;
         if (!accelerators || !TranslateAcceleratorW(hwnd, accelerators, &message)) {
             TranslateMessage(&message);
             DispatchMessageW(&message);
