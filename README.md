@@ -27,6 +27,7 @@
 - Uses Direct3D 11 to scale the captured image on the GPU with linear filtering in windowed, fullscreen, and PiP modes; mipmaps are generated only when the image is significantly downscaled. If the installed graphics driver cannot initialize the D3D11/DXGI renderer, PlayView automatically falls back to a buffered GDI renderer so the preview remains usable.
 - Reuses Direct3D render-target views and Direct2D back-buffer targets between paints, recreating them only when a window is resized.
 - Keeps capture and presentation decoupled through a three-slot frame exchange. If the UI falls behind, older queued frames are dropped rather than building up latency.
+- Signals new frames through a coalesced auto-reset event instead of posting one high-priority window message per frame, so continuous 60 FPS capture does not starve mouse, keyboard, window-management, or shutdown messages.
 - Optional performance statistics show captured FPS, unique video frames presented by the main window, and dropped frames. Values are bounded by the capture format's reported frame rate and reset when the stream becomes stale. Enable them from **View → Show performance statistics**.
 - Video device start/stop requests are handled by a persistent background controller so the interface does not wait for a capture driver to release its reader. Native resolution modes are queried after the first frames are already flowing.
 
@@ -241,6 +242,7 @@ PlayView está desarrollado en C++20 y utiliza componentes nativos de Windows:
 - Direct3D 11 y swap chains DXGI flip-model para el escalado y la presentación de video mediante GPU, incluida la reducción de tamaño mediante filtrado lineal.
 - Direct2D y DirectWrite para las superposiciones y los textos de la interfaz acelerados por GPU.
 - Un intercambio atómico de fotogramas de tres búferes entre el hilo de captura y el hilo de interfaz. Cuando es necesario, se descartan fotogramas antiguos para que la interfaz muestre el más reciente disponible.
+- Las nuevas imágenes se notifican mediante un evento auto-reset agrupado, en lugar de publicar un mensaje de alta prioridad por cada fotograma. Así, una captura continua a 60 FPS no desplaza la atención de los clics, el teclado, la gestión de ventanas ni el cierre de la aplicación.
 - Un controlador persistente en segundo plano que serializa las solicitudes de inicio y parada para evitar que la interfaz espere a que el controlador de captura libere el lector de video.
 - Windows Imaging Component para procesar los iconos personalizados de los perfiles.
 

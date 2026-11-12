@@ -58,7 +58,6 @@ constexpr wchar_t kAppName[] = L"PlayView";
 constexpr wchar_t kWindowClass[] = L"PlayViewMainWindow";
 constexpr wchar_t kPipWindowClass[] = L"PlayViewPictureInPictureWindow";
 constexpr wchar_t kAboutWindowClass[] = L"PlayViewAboutWindow";
-constexpr UINT WM_APP_FRAME = WM_APP + 1;
 constexpr UINT WM_APP_VIDEO_READY = WM_APP + 2;
 constexpr UINT WM_APP_VIDEO_LOST = WM_APP + 3;
 constexpr UINT WM_APP_AUDIO_LOST = WM_APP + 4;
@@ -335,7 +334,7 @@ int g_captureFps = 0;
 int g_renderFps = 0;
 int g_droppedFps = 0;
 ULONGLONG g_statsLastTick = 0;
-std::atomic_bool g_frameMessagePending{ false };
+HANDLE g_frameReadyEvent = nullptr; // auto-reset event: coalesces frame-ready signals without flooding the UI queue
 std::atomic_int g_volume{ 80 };
 std::atomic_bool g_muted{ false };
 std::atomic_bool g_videoHasFrame{ false };
@@ -438,21 +437,14 @@ bool HasQueuedReadyFrame() {
     return false;
 }
 
-// Coalesce capture notifications: at most one WM_APP_FRAME may be queued.
-// The UI handler keeps this flag set while it renders, then checks the slots
-// again and schedules one follow-up if newer frames arrived in the meantime.
-// This prevents a slow Present/D2D call from flooding the Win32 message queue
-// and starving input, menus, window management, and shutdown messages.
-void QueueVideoFrameMessage(HWND notifyWindow) {
-    if (!notifyWindow || !IsWindow(notifyWindow)) return;
-    bool expected = false;
-    if (!g_frameMessagePending.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel, std::memory_order_acquire)) return;
-    if (!PostMessageW(notifyWindow, WM_APP_FRAME, 0, 0)) {
-        // The target window may be closing or its thread queue may be full.
-        // Always release the token so a later frame can retry notification.
-        g_frameMessagePending.store(false, std::memory_order_release);
-    }
+// Signal the UI through an auto-reset event instead of posting one Win32
+// message for every captured frame. Posted WM_APP messages have higher queue
+// priority than mouse/keyboard input; at 60 FPS they can starve the window
+// procedure even if they are coalesced to one pending message. An event is
+// coalesced by the kernel and consumed by the message pump only after it has
+// dispatched pending user input and window-management messages.
+void SignalVideoFrameReady() {
+    if (g_frameReadyEvent) SetEvent(g_frameReadyEvent);
 }
 
 int CalculateFramesPerSecond(uint64_t frameCount, ULONGLONG elapsedMs) {
@@ -1309,7 +1301,7 @@ private:
                     signaledReady = true;
                     PostMessageW(notifyWindow, WM_APP_VIDEO_READY, 0, 0);
                 }
-                QueueVideoFrameMessage(notifyWindow);
+                SignalVideoFrameReady();
                 if (!modesPublished && ++framesBeforeModeQuery >= 24 && !stopRequested_.load()) {
                     modesPublished = true;
                     auto update = std::make_unique<VideoModesUpdate>();
@@ -1776,9 +1768,9 @@ void StartSelectedVideo(bool showErrorIfMissing = true) {
     g_nominalVideoFps.store(60, std::memory_order_relaxed);
     g_lastVideoFrameTick.store(0, std::memory_order_relaxed);
     ResetPerformanceStats();
-    // Do not clear g_frameMessagePending here. If a frame notification is
-    // already queued, that handler will consume any frame from the new capture
-    // session too. Clearing it here could enqueue duplicate render messages.
+    // Do not reset the auto-reset frame event during a device switch. A signal
+    // may correspond to a frame published by the previous session; the pump
+    // checks the ready slots before rendering, so stale signals are harmless.
     ClearQueuedFrames();
     PostMessageW(g_hwnd, WM_APP_CLEAR_FRAME, 0, 0);
     if (g_settings.videoId.empty()) {
@@ -2800,6 +2792,27 @@ void DrawRendererFallback(HDC dc, HWND hwnd) {
         DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
 }
 
+// Called by the message pump when the frame-ready event is signaled. It is
+// deliberately not invoked through a high-priority WM_APP message. The pump
+// dispatches ordinary input/window messages first, then renders the newest
+// available frame once. A busy capture device therefore cannot monopolize the
+// UI queue or make the window appear hung.
+void RenderLatestVideoFrame() {
+    auto renderWindowNow = [](HWND target, bool compact) {
+        if (!target || !IsWindow(target) || !IsWindowVisible(target) || IsIconic(target)) return;
+        if (g_videoRenderer.Render(target, compact)) {
+            ValidateRect(target, nullptr);
+        } else {
+            // Let the normal low-priority WM_PAINT path draw the compatibility
+            // GDI frame. UpdateWindow() is intentionally avoided here because
+            // it would synchronously re-enter painting from the frame pump.
+            InvalidateVideoSurface(target);
+        }
+    };
+    renderWindowNow(g_hwnd, false);
+    if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) renderWindowNow(g_pipHwnd, true);
+}
+
 void InvalidateVideoSurface(HWND target) {
     if (!target || !IsWindow(target)) return;
     RECT area{};
@@ -3457,37 +3470,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         InvalidateVideoSurface(hwnd);
         if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) InvalidateVideoSurface(g_pipHwnd);
         return 0;
-    case WM_APP_FRAME: {
-        // Keep g_frameMessagePending set throughout rendering. Capture can
-        // replace stale ready slots, but it cannot post another UI message
-        // until this one completes. This bounds the message queue to one frame.
-        // Render the newest capture frame directly from this UI-thread message.
-        // WM_PAINT is deliberately retained for exposure/resize and fallback,
-        // but it is not used as the video clock: Windows coalesces WM_PAINT and
-        // may dispatch it at a lower cadence in an overlapped window.
-        auto renderWindowNow = [](HWND target, bool compact) {
-            if (!target || !IsWindow(target) || !IsWindowVisible(target) || IsIconic(target)) return;
-            if (g_videoRenderer.Render(target, compact)) {
-                // Render() refreshed the entire DXGI surface. Clear any older
-                // invalid region so it cannot trigger a redundant paint later.
-                ValidateRect(target, nullptr);
-            } else {
-                // D3D11 unavailable: let the existing GDI compatibility path
-                // paint through WM_PAINT instead of blocking capture delivery.
-                InvalidateVideoSurface(target);
-                UpdateWindow(target);
-            }
-        };
-        renderWindowNow(hwnd, false);
-        if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) renderWindowNow(g_pipHwnd, true);
-
-        // Release the notification token only after both targets have consumed
-        // the newest frame. Recheck after releasing it to close the race where
-        // capture published a frame while the token was still held.
-        g_frameMessagePending.store(false, std::memory_order_release);
-        if (HasQueuedReadyFrame()) QueueVideoFrameMessage(hwnd);
-        return 0;
-    }
     case WM_APP_REBUILD_MENU:
         CreateAppMenu(hwnd);
         return 0;
@@ -3690,6 +3672,18 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         return 1;
     }
 
+    // Auto-reset event coalesces 60 FPS frame notifications without filling
+    // the Win32 posted-message queue. The UI message loop handles input first
+    // and renders only the latest frame when this event is signaled.
+    g_frameReadyEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_frameReadyEvent) {
+        MessageBoxW(nullptr, L"Could not create the video frame event.",
+            L"PlayView", MB_OK | MB_ICONERROR);
+        MFShutdown();
+        if (SUCCEEDED(comHr)) CoUninitialize();
+        return 1;
+    }
+
     INITCOMMONCONTROLSEX controls{ sizeof(controls), ICC_BAR_CLASSES | ICC_WIN95_CLASSES };
     InitCommonControlsEx(&controls);
 
@@ -3725,6 +3719,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     wc.lpszClassName = kWindowClass;
     if (!RegisterClassExW(&wc)) {
+        if (g_frameReadyEvent) { CloseHandle(g_frameReadyEvent); g_frameReadyEvent = nullptr; }
         MFShutdown();
         if (SUCCEEDED(comHr)) CoUninitialize();
         return 1;
@@ -3734,6 +3729,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 1180, 760, nullptr, nullptr, instance, nullptr);
     if (!hwnd) {
+        if (g_frameReadyEvent) { CloseHandle(g_frameReadyEvent); g_frameReadyEvent = nullptr; }
         MFShutdown();
         if (SUCCEEDED(comHr)) CoUninitialize();
         return 1;
@@ -3777,21 +3773,52 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     HACCEL accelerators = CreateAcceleratorTableW(acceleratorEntries, static_cast<int>(std::size(acceleratorEntries)));
 
     MSG message{};
-    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
-        // The About window is modeless, so route its keyboard navigation
-        // through the dialog manager without blocking the main message loop.
-        if (g_aboutHwnd && IsDialogMessageW(g_aboutHwnd, &message)) continue;
-        if (!accelerators || !TranslateAcceleratorW(hwnd, accelerators, &message)) {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
+    bool quitRequested = false;
+    int exitCode = 0;
+    HANDLE frameEvent = g_frameReadyEvent;
+    while (!quitRequested) {
+        const DWORD waitResult = MsgWaitForMultipleObjectsEx(
+            1, &frameEvent, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if (waitResult == WAIT_FAILED) {
+            Log(L"MsgWaitForMultipleObjectsEx failed; error=" + std::to_wstring(GetLastError()));
+            break;
         }
+
+        // Drain a bounded batch. This gives mouse, keyboard, menus, minimize,
+        // close and dialog messages priority over continuous capture frames,
+        // while still guaranteeing that a busy input queue cannot starve video.
+        for (unsigned int processed = 0; processed < 64; ++processed) {
+            if (!PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) break;
+            if (message.message == WM_QUIT) {
+                exitCode = static_cast<int>(message.wParam);
+                quitRequested = true;
+                break;
+            }
+            // The About window is modeless, so route its keyboard navigation
+            // through the dialog manager without blocking the main message loop.
+            if (g_aboutHwnd && IsDialogMessageW(g_aboutHwnd, &message)) continue;
+            if (!accelerators || !TranslateAcceleratorW(hwnd, accelerators, &message)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        if (quitRequested) break;
+
+        // The wait consumes the auto-reset event if it caused the wake. Also
+        // check once after dispatch: a frame may have arrived while handling
+        // user input. Multiple signals collapse into one render of the newest
+        // slot, never an unbounded stream of high-priority window messages.
+        const bool frameSignaled = (waitResult == WAIT_OBJECT_0) ||
+            (WaitForSingleObject(frameEvent, 0) == WAIT_OBJECT_0);
+        if (frameSignaled && HasQueuedReadyFrame()) RenderLatestVideoFrame();
     }
     if (accelerators) DestroyAcceleratorTable(accelerators);
 
     g_videoCapture.Stop();
     g_videoCapture.ShutdownAndWait();
     g_audioCapture.Stop();
+    if (g_frameReadyEvent) { CloseHandle(g_frameReadyEvent); g_frameReadyEvent = nullptr; }
     MFShutdown();
     if (SUCCEEDED(comHr)) CoUninitialize();
-    return static_cast<int>(message.wParam);
+    return exitCode;
 }
