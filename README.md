@@ -19,6 +19,7 @@
 
 - **Windowed mode:** Move, resize, or maximize the window. PlayView remembers its size, position, and maximized state.
 - **Fullscreen mode:** Toggle fullscreen with `F11`. When you exit, the previous window state is restored.
+- **Automatic cursor hiding:** The pointer hides after two seconds without movement while it is over PlayView, including fullscreen mode. It reappears as soon as it moves; outside the window, the normal Windows cursor remains visible.
 - **Options bar:** In windowed mode, the bar can stay visible or appear when the pointer moves into the top area. In fullscreen mode, it appears and hides automatically as the pointer enters or leaves the top area, regardless of the windowed-mode preference.
 - Controls are overlaid on the video and do not reserve space inside the displayed image.
 
@@ -26,9 +27,11 @@
 
 - Uses Direct3D 11 to scale the captured image on the GPU with linear filtering in windowed, fullscreen, and PiP modes; mipmaps are generated only when the image is significantly downscaled. If the installed graphics driver cannot initialize the D3D11/DXGI renderer, PlayView automatically falls back to a buffered GDI renderer so the preview remains usable.
 - Reuses Direct3D render-target views and Direct2D back-buffer targets between paints, recreating them only when a window is resized.
-- Keeps capture and presentation decoupled through a three-slot frame exchange. If the UI falls behind, older queued frames are dropped rather than building up latency.
-- Signals new frames through a coalesced auto-reset event instead of posting one high-priority window message per frame, so continuous 60 FPS capture does not starve mouse, keyboard, window-management, or shutdown messages.
-- Optional performance statistics show captured FPS, unique video frames presented by the main window, and dropped frames. Values are bounded by the capture format's reported frame rate and reset when the stream becomes stale. Enable them from **View → Show performance statistics**.
+- Keeps capture and presentation decoupled through an atomic three-slot frame exchange. If the render worker falls behind, older queued frames are dropped rather than building up latency.
+- A dedicated render worker owns Direct3D 11, DXGI and Direct2D presentation. The UI thread remains responsible for menus, dialogs, controls and window management, so modal menus no longer pause the presentation loop.
+- The main window uses vertical synchronization in windowed mode as an experiment to address the reported half-refresh presentation cadence. Fullscreen and PiP retain unsynchronized presentation, which already performed normally in the user's tests.
+- New frames and interface redraw requests wake the render worker through coalesced events instead of posting one high-priority window message per captured frame.
+- Optional performance statistics show captured FPS, unique frames successfully submitted for presentation by the main window, and dropped frames. The presentation counter measures successful presentation calls, not the exact scan-out rate reported by the monitor. Values are bounded by the capture format's reported frame rate and reset when the stream becomes stale. Enable them from **View → Show performance statistics**.
 - Video device start/stop requests are handled by a persistent background controller so the interface does not wait for a capture driver to release its reader. Native resolution modes are queried after the first frames are already flowing.
 
 ### Picture in Picture (PiP)
@@ -150,6 +153,7 @@ PlayView does not use Electron and does not require VLC, FFmpeg, or another medi
 
 - **Modo ventana:** permite mover, cambiar el tamaño o maximizar la ventana. PlayView recuerda sus dimensiones, posición y estado maximizado.
 - **Pantalla completa:** permite alternar a pantalla completa con `F11`. Al salir, se restaura el estado anterior de la ventana.
+- **Ocultación automática del cursor:** el puntero desaparece después de dos segundos sin movimiento cuando está sobre el área de reproducción, tanto en modo ventana como en pantalla completa. Vuelve a aparecer al moverlo y permanece visible fuera de PlayView o al interactuar con los controles.
 - **Barra de opciones:** en modo ventana, la barra puede permanecer visible o aparecer cuando el cursor se desplaza hacia la zona superior. En pantalla completa, aparece y se oculta automáticamente al entrar o salir el cursor de esa zona, independientemente de la preferencia del modo ventana.
 - Los controles se superponen al video y no reservan espacio dentro de la imagen mostrada.
 
@@ -157,10 +161,12 @@ PlayView does not use Electron and does not require VLC, FFmpeg, or another medi
 
 - Utiliza Direct3D 11 para escalar la imagen mediante la GPU con filtrado lineal en los modos ventana, pantalla completa y PiP, genera mipmaps únicamente cuando la imagen se reduce de forma significativa, para conservar la calidad de la reducción sin añadir trabajo gráfico cuando no hace falta.
 - Reutiliza las vistas de destino de Direct3D y los destinos de búfer de Direct2D entre repintados; solo los recrea cuando cambia el tamaño de una ventana.
-- Desacopla la captura y la presentación mediante un intercambio de tres búferes. Si la interfaz se retrasa, descarta fotogramas antiguos en lugar de acumular latencia.
+- Desacopla la captura y la presentación mediante un intercambio atómico de tres búferes. Si el renderizador se retrasa, descarta fotogramas antiguos en lugar de acumular latencia.
+- Un hilo de renderizado independiente gestiona Direct3D 11, DXGI y Direct2D. El hilo de interfaz continúa atendiendo menús, diálogos y controles, por lo que la apertura de menús ya no debe detener el ciclo de presentación.
+- La ventana principal utiliza sincronización vertical en modo ventana como experimento de cadencia. La pantalla completa y PiP conservan la presentación sin sincronización vertical.
 - Las solicitudes para iniciar o detener la captura se procesan mediante un controlador persistente en segundo plano; la interfaz no espera a que el controlador del dispositivo libere el lector de video.
 - Las resoluciones nativas se consultan después de que ya comenzaron a recibirse los primeros fotogramas, sin abrir una segunda instancia de la capturadora.
-- Incluye estadísticas opcionales de FPS de captura, fotogramas de video únicos presentados por la ventana principal y fotogramas descartados. Los valores se limitan a la frecuencia informada por el formato de captura y se reinician cuando la señal deja de actualizarse. Se activan desde **Ver → Mostrar estadísticas de rendimiento**.
+- Incluye estadísticas opcionales de FPS de captura, fotogramas únicos cuya presentación se completó correctamente en la ventana principal y fotogramas descartados. El contador de presentación mide las llamadas de presentación completadas, no la frecuencia exacta con la que el monitor muestra cada imagen. Los valores se limitan a la frecuencia informada por el formato de captura y se reinician cuando la señal deja de actualizarse. Se activan desde **Ver → Mostrar estadísticas de rendimiento**.
 
 ### Picture in Picture (PiP)
 
@@ -241,8 +247,9 @@ PlayView está desarrollado en C++20 y utiliza componentes nativos de Windows:
 - WinMM (`waveOut`) para reproducir el audio capturado.
 - Direct3D 11 y swap chains DXGI flip-model para el escalado y la presentación de video mediante GPU, incluida la reducción de tamaño mediante filtrado lineal.
 - Direct2D y DirectWrite para las superposiciones y los textos de la interfaz acelerados por GPU.
-- Un intercambio atómico de fotogramas de tres búferes entre el hilo de captura y el hilo de interfaz. Cuando es necesario, se descartan fotogramas antiguos para que la interfaz muestre el más reciente disponible.
-- Las nuevas imágenes se notifican mediante un evento auto-reset agrupado, en lugar de publicar un mensaje de alta prioridad por cada fotograma. Así, una captura continua a 60 FPS no desplaza la atención de los clics, el teclado, la gestión de ventanas ni el cierre de la aplicación.
+- Un intercambio atómico de fotogramas de tres búferes entre el hilo de captura y el hilo de renderizado. Cuando es necesario, se descartan fotogramas antiguos para presentar el más reciente disponible.
+- Las nuevas imágenes se notifican mediante un evento auto-reset agrupado, en lugar de publicar un mensaje por cada fotograma. El hilo de renderizado mantiene la presentación separada del bucle de mensajes de la interfaz.
+- La presentación de la ventana principal usa `Present(1, 0)` en modo ventana para sincronizarla con la frecuencia de actualización de la pantalla; la pantalla completa y PiP usan `Present(0, 0)`.
 - Un controlador persistente en segundo plano que serializa las solicitudes de inicio y parada para evitar que la interfaz espere a que el controlador de captura libere el lector de video.
 - Windows Imaging Component para procesar los iconos personalizados de los perfiles.
 
@@ -262,8 +269,8 @@ PlayView no utiliza Electron ni requiere tener instalado VLC, FFmpeg u otro repr
 
 ### Rendering and responsiveness
 
-The windowed renderer submits frames without blocking the UI thread at vertical blank. Windows Desktop Window Manager (DWM) composes the flip-model swap chain at the display refresh rate. The About window is modeless, so opening it does not disable the main application. The volume tooltip is explicitly dismissed whenever the options bar hides or PlayView loses activation.
+The D3D11/DXGI presentation loop runs on a dedicated worker, separate from the Win32 UI message loop. It continues consuming captured frames while the UI thread handles menu tracking, dialogs, input and window-management messages. A synchronized UI-state snapshot is passed to the renderer, and all D3D11/DXGI/Direct2D device-context operations remain on the render worker. The About window remains modeless, and the volume tooltip is dismissed whenever the options bar hides or PlayView loses activation.
 
 ### Renderizado y respuesta de la interfaz
 
-El renderizador en modo ventana envía los fotogramas sin bloquear el hilo de interfaz esperando al siguiente refresco vertical. El Administrador de ventanas del escritorio de Windows (DWM) compone la cadena de intercambio flip-model según la frecuencia de la pantalla. La ventana Acerca de no es modal, por lo que abrirla no deshabilita la aplicación principal. La ayuda emergente del volumen se cierra expresamente cuando se oculta la barra de opciones o PlayView pierde la activación.
+El ciclo de presentación D3D11/DXGI se ejecuta en un hilo independiente del bucle de mensajes de la interfaz Win32. Continúa procesando los fotogramas capturados mientras el hilo principal atiende menús, diálogos, entradas y cambios de ventana. El renderizador recibe una copia sincronizada del estado de la interfaz, y todas las operaciones sobre los contextos D3D11, DXGI y Direct2D permanecen dentro del hilo de renderizado. La ventana Acerca de sigue siendo no modal y la ayuda emergente del volumen se cierra cuando se oculta la barra de opciones o PlayView pierde la activación.

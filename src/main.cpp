@@ -67,6 +67,8 @@ constexpr UINT WM_APP_VIDEO_MODES = WM_APP + 7;
 constexpr UINT WM_APP_OVERLAY_RECHECK = WM_APP + 8;
 constexpr UINT_PTR TIMER_RECONNECT = 1;
 constexpr UINT_PTR TIMER_STATS = 3;
+constexpr UINT_PTR TIMER_CURSOR_AUTO_HIDE = 4;
+constexpr UINT kCursorAutoHideDelayMs = 2000;
 
 constexpr int IDC_VIDEO_DEVICE = 1001;
 constexpr int IDC_AUDIO_DEVICE = 1002;
@@ -100,6 +102,20 @@ constexpr int ID_PROFILE_MENU_LIMIT = 100;
 enum class LanguagePreference : int { Automatic = 0, Spanish = 1, English = 2 };
 enum class UiLanguage { Spanish, English };
 
+struct RenderUiState {
+    bool overlayVisible = true;
+    bool showPerformanceStats = false;
+    bool pipHover = false;
+    int windowMode = 0;
+    int volume = 80;
+    int captureFps = 0;
+    int renderFps = 0;
+    int droppedFps = 0;
+    UiLanguage language = UiLanguage::Spanish;
+    std::wstring statusText;
+    std::wstring videoStatus;
+};
+
 enum class TextId {
     VideoSelect, AudioUnconfigured,
     SettingsMenu, LanguageMenu, LanguageAutomatic, LanguageSpanish, LanguageEnglish, PerformanceStatsMenu,
@@ -129,8 +145,8 @@ enum class TextId {
 LanguagePreference g_languagePreference = LanguagePreference::Automatic;
 UiLanguage g_uiLanguage = UiLanguage::Spanish;
 
-const wchar_t* Tr(TextId id) {
-    const bool en = g_uiLanguage == UiLanguage::English;
+const wchar_t* Tr(TextId id, UiLanguage language) {
+    const bool en = language == UiLanguage::English;
     switch (id) {
     case TextId::VideoSelect: return en ? L"Select a capture device to begin." : L"Selecciona una capturadora para comenzar.";
     case TextId::AudioUnconfigured: return en ? L"Audio not configured." : L"Audio sin configurar.";
@@ -220,6 +236,10 @@ const wchar_t* Tr(TextId id) {
     return L"";
 }
 
+const wchar_t* Tr(TextId id) {
+    return Tr(id, g_uiLanguage);
+}
+
 UiLanguage ResolveUiLanguage(LanguagePreference preference) {
     if (preference == LanguagePreference::Spanish) return UiLanguage::Spanish;
     if (preference == LanguagePreference::English) return UiLanguage::English;
@@ -273,8 +293,8 @@ struct ProfileEntry {
 };
 
 // Three-slot lock-free frame exchange. The capture worker writes into a FREE
-// slot while the UI thread uploads the newest READY slot to the GPU. No frame
-// mutex is held during scaling, drawing, or presentation.
+// slot while the dedicated render worker uploads the newest READY slot to the
+// GPU. No frame mutex is held during scaling, drawing, or presentation.
 enum class FrameSlotState : int { Free = 0, Writing = 1, Ready = 2, Reading = 3 };
 struct FrameSlot {
     std::vector<BYTE> pixels;
@@ -308,6 +328,7 @@ uint64_t g_compatibilityLastPresentedSequence = 0;
 
 HWND g_hwnd = nullptr;
 HWND g_pipHwnd = nullptr;
+std::atomic<HWND> g_renderPipHwnd{ nullptr };
 HWND g_aboutHwnd = nullptr;
 HWND g_videoCombo = nullptr;
 HWND g_audioCombo = nullptr;
@@ -334,7 +355,7 @@ int g_captureFps = 0;
 int g_renderFps = 0;
 int g_droppedFps = 0;
 ULONGLONG g_statsLastTick = 0;
-HANDLE g_frameReadyEvent = nullptr; // auto-reset event: coalesces frame-ready signals without flooding the UI queue
+HANDLE g_frameReadyEvent = nullptr; // auto-reset event consumed by the dedicated render worker
 std::atomic_int g_volume{ 80 };
 std::atomic_bool g_muted{ false };
 std::atomic_bool g_videoHasFrame{ false };
@@ -343,6 +364,14 @@ ULONGLONG g_videoStartTick = 0;
 std::wstring g_videoStatus;
 std::wstring g_audioStatus;
 std::wstring g_statusText;
+std::mutex g_renderUiStateMutex;
+RenderUiState g_renderUiState;
+std::atomic_bool g_d3dRendererActive{ false };
+std::atomic_bool g_clearRendererFrameRequested{ false };
+std::atomic_bool g_resetPipTargetRequested{ false };
+HANDLE g_renderRequestEvent = nullptr;
+HANDLE g_renderStopEvent = nullptr;
+std::thread g_renderThread;
 ULONGLONG g_nextVideoRetry = 0;
 ULONGLONG g_nextAudioRetry = 0;
 RECT g_restoreRect{ 100, 100, 1280, 860 };
@@ -358,6 +387,7 @@ bool g_hasPreFullscreenPlacement = false;
 bool g_overlayVisible = true;
 bool g_suppressToolbarRevealUntilLeave = false;
 bool g_pipHover = false;
+bool g_mainCursorHidden = false;
 std::filesystem::path g_appDirectory;
 std::filesystem::path g_settingsPath;
 std::filesystem::path g_logPath;
@@ -374,8 +404,8 @@ FrameSlot* AcquireFrameSlotForWrite() {
         if (slot.state.compare_exchange_strong(expected, static_cast<int>(FrameSlotState::Writing),
                 std::memory_order_acq_rel)) return &slot;
     }
-    // If the UI is briefly behind, replace the oldest queued frame rather
-    // than blocking capture. This is preferable to displaying stale frames.
+    // If the render worker is briefly behind, replace the oldest queued frame
+    // rather than blocking capture. This is preferable to displaying stale frames.
     FrameSlot* oldest = nullptr;
     for (auto& slot : g_frameSlots) {
         if (slot.state.load(std::memory_order_acquire) == static_cast<int>(FrameSlotState::Ready) &&
@@ -404,7 +434,7 @@ FrameSlot* AcquireLatestFrameForRead() {
         int expected = static_cast<int>(FrameSlotState::Ready);
         if (!newest->state.compare_exchange_strong(expected, static_cast<int>(FrameSlotState::Reading),
                 std::memory_order_acq_rel)) continue;
-        // Discard older frames that accumulated while the UI was busy.
+        // Discard older frames that accumulated while the render worker was busy.
         for (auto& slot : g_frameSlots) {
             if (&slot == newest) continue;
             expected = static_cast<int>(FrameSlotState::Ready);
@@ -429,22 +459,37 @@ void ClearQueuedFrames() {
     }
 }
 
-bool HasQueuedReadyFrame() {
-    for (const auto& slot : g_frameSlots) {
-        if (slot.state.load(std::memory_order_acquire) == static_cast<int>(FrameSlotState::Ready))
-            return true;
-    }
-    return false;
-}
-
-// Signal the UI through an auto-reset event instead of posting one Win32
-// message for every captured frame. Posted WM_APP messages have higher queue
-// priority than mouse/keyboard input; at 60 FPS they can starve the window
-// procedure even if they are coalesced to one pending message. An event is
-// coalesced by the kernel and consumed by the message pump only after it has
-// dispatched pending user input and window-management messages.
+// Signal the dedicated render worker through an auto-reset event instead of
+// posting one Win32 message for every captured frame. Kernel event coalescing
+// keeps capture notifications bounded without competing with the UI queue.
 void SignalVideoFrameReady() {
     if (g_frameReadyEvent) SetEvent(g_frameReadyEvent);
+}
+
+void SignalRenderRequest() {
+    if (g_renderRequestEvent) SetEvent(g_renderRequestEvent);
+}
+
+void PublishRendererUiState() {
+    RenderUiState state;
+    state.overlayVisible = g_overlayVisible;
+    state.showPerformanceStats = g_settings.showPerformanceStats;
+    state.pipHover = g_pipHover;
+    state.windowMode = g_windowMode;
+    state.volume = g_settings.volume;
+    state.captureFps = g_captureFps;
+    state.renderFps = g_renderFps;
+    state.droppedFps = g_droppedFps;
+    state.language = g_uiLanguage;
+    state.statusText = g_statusText;
+    state.videoStatus = g_videoStatus;
+    std::lock_guard<std::mutex> lock(g_renderUiStateMutex);
+    g_renderUiState = std::move(state);
+}
+
+RenderUiState GetRendererUiState() {
+    std::lock_guard<std::mutex> lock(g_renderUiStateMutex);
+    return g_renderUiState;
 }
 
 int CalculateFramesPerSecond(uint64_t frameCount, ULONGLONG elapsedMs) {
@@ -1589,6 +1634,47 @@ void UpdateVolumeTooltip() {
     g_volumeTooltipVisible = true;
 }
 
+bool IsAnyToolbarComboDropped();
+
+void ShowMainCursor() {
+    if (g_mainCursorHidden) {
+        g_mainCursorHidden = false;
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+    }
+    if (g_hwnd) {
+        KillTimer(g_hwnd, TIMER_CURSOR_AUTO_HIDE);
+        SetTimer(g_hwnd, TIMER_CURSOR_AUTO_HIDE, kCursorAutoHideDelayMs, nullptr);
+    }
+}
+
+void TryHideMainCursor() {
+    if (!g_hwnd || !IsWindowVisible(g_hwnd) || !IsWindowEnabled(g_hwnd) ||
+        GetForegroundWindow() != g_hwnd || IsIconic(g_hwnd)) return;
+
+    POINT screen{};
+    if (!GetCursorPos(&screen)) return;
+    HWND underCursor = WindowFromPoint(screen);
+    if (!underCursor || GetAncestor(underCursor, GA_ROOT) != g_hwnd) return;
+
+    POINT client = screen;
+    if (!ScreenToClient(g_hwnd, &client)) return;
+    RECT bounds{};
+    GetClientRect(g_hwnd, &bounds);
+    if (client.x < 0 || client.y < 0 || client.x >= bounds.right || client.y >= bounds.bottom) return;
+
+    // Keep the pointer visible over the options bar, its controls, and an
+    // expanded combo list. Only the video viewing area auto-hides the cursor.
+    if (g_overlayVisible && client.y <= 112) return;
+    if (IsAnyToolbarComboDropped()) return;
+
+    // WindowFromPoint can return the main window for the video surface, but
+    // should not be allowed to hide the cursor over child controls or dialogs.
+    if (underCursor != g_hwnd && IsChild(g_hwnd, underCursor)) return;
+
+    g_mainCursorHidden = true;
+    SetCursor(nullptr);
+}
+
 void HideVolumeTooltip() {
     if (!g_volumeTooltip) {
         g_volumeTooltipVisible = false;
@@ -1643,6 +1729,7 @@ LRESULT CALLBACK ToolbarHoverSubclass(HWND hwnd, UINT message, WPARAM wParam, LP
     case WM_MOUSEMOVE: {
         TRACKMOUSEEVENT tracking{ sizeof(tracking), TME_LEAVE, hwnd, 0 };
         TrackMouseEvent(&tracking);
+        ShowMainCursor();
         // Child controls cover the parent window's client area. Re-evaluate
         // the toolbar immediately while the pointer moves over those controls.
         UpdateOverlayVisibility(false);
@@ -1769,9 +1856,11 @@ void StartSelectedVideo(bool showErrorIfMissing = true) {
     g_lastVideoFrameTick.store(0, std::memory_order_relaxed);
     ResetPerformanceStats();
     // Do not reset the auto-reset frame event during a device switch. A signal
-    // may correspond to a frame published by the previous session; the pump
-    // checks the ready slots before rendering, so stale signals are harmless.
+    // may correspond to a frame published by the previous session; the render
+    // worker reads the newest ready slot, so stale signals are harmless.
     ClearQueuedFrames();
+    g_clearRendererFrameRequested.store(true, std::memory_order_release);
+    SignalRenderRequest();
     PostMessageW(g_hwnd, WM_APP_CLEAR_FRAME, 0, 0);
     if (g_settings.videoId.empty()) {
         g_videoStatus = Tr(TextId::VideoSelect);
@@ -2112,8 +2201,8 @@ class VideoRenderer {
     struct WindowTarget {
         HWND hwnd = nullptr;
         ComPtr<IDXGISwapChain3> swapChain;
-        // Keep views for both flip-model back buffers. Recreating COM views on
-        // every paint adds avoidable CPU overhead and can stall the UI thread.
+        // Keep views for each flip-model back buffer. Recreating COM views on
+        // every frame adds avoidable CPU overhead and can stall presentation.
         // Three flip-model back buffers reduce stalls while DWM is composing
         // windowed presentation and keep a fresh frame available for each vblank.
         std::array<ComPtr<ID3D11RenderTargetView>, 3> rtvs;
@@ -2121,7 +2210,7 @@ class VideoRenderer {
         UINT width = 0, height = 0;
     };
 public:
-    bool Render(HWND hwnd, bool compact) {
+    bool Render(HWND hwnd, bool compact, const RenderUiState& state) {
         if (disabled_) return false;
         if (!EnsureDevice()) { DisableAfterFailure(); return false; }
         WindowTarget& t = compact ? pipTarget_ : mainTarget_;
@@ -2177,10 +2266,10 @@ public:
         d2d_->SetTarget(t.d2dTargets[bufferIndex].Get());
         d2d_->BeginDraw();
         d2d_->SetTransform(D2D1::Matrix3x2F::Identity());
-        if (!frameView_) DrawNoFrame(hwnd);
-        if (!compact && g_overlayVisible) DrawToolbar(hwnd);
-        if (!compact && g_settings.showPerformanceStats) DrawStats(hwnd);
-        if (compact && g_pipHover) DrawPipOverlay(hwnd);
+        if (!frameView_) DrawNoFrame(hwnd, state);
+        if (!compact && state.overlayVisible) DrawToolbar(hwnd, state);
+        if (!compact && state.showPerformanceStats) DrawStats(hwnd, state);
+        if (compact && state.pipHover) DrawPipOverlay(hwnd);
         const HRESULT drawHr = d2d_->EndDraw();
         d2d_->SetTarget(nullptr);
         if (FAILED(drawHr)) {
@@ -2189,15 +2278,15 @@ public:
             return false;
         }
 
-        // Frame notifications are already coalesced by the auto-reset event in
-        // the message pump, so there is no need to drop a frame merely because
-        // DWM has not released the next flip-model buffer yet. DO_NOT_WAIT was
-        // causing DXGI_ERROR_WAS_STILL_DRAWING in composed windowed mode and
-        // effectively discarded every other frame on some systems. Present
-        // with SyncInterval=0 and no DO_NOT_WAIT: DXGI queues the newest frame
-        // using the three-buffer swap chain, while the bounded event-driven
-        // pump continues to service input and window messages between frames.
-        const HRESULT presentHr = t.swapChain->Present(0, 0);
+        // The main window uses vertical synchronization while windowed. This
+        // is a deliberate pacing experiment for systems where unsynchronized
+        // flip-model presents appear at half the desktop refresh cadence.
+        // Fullscreen and PiP retain SyncInterval=0 because they already sustain
+        // the expected capture rate in the user's setup. The render worker is
+        // independent from the Win32 message loop, so waiting for a windowed
+        // vblank cannot block menu tracking or other UI interaction.
+        const UINT syncInterval = (!compact && state.windowMode == 0) ? 1u : 0u;
+        const HRESULT presentHr = t.swapChain->Present(syncInterval, 0);
         if (presentHr == DXGI_ERROR_WAS_STILL_DRAWING) {
             // Defensive fallback for drivers that still report a transient
             // busy state. The next coalesced capture event retries the latest
@@ -2234,6 +2323,9 @@ public:
     void DestroyTarget(HWND hwnd) {
         if (mainTarget_.hwnd == hwnd) ResetTarget(mainTarget_);
         if (pipTarget_.hwnd == hwnd) ResetTarget(pipTarget_);
+    }
+    void DestroyPipTarget() {
+        ResetTarget(pipTarget_);
     }
     void Destroy() {
         ResetTarget(mainTarget_); ResetTarget(pipTarget_); ClearFrame();
@@ -2415,7 +2507,7 @@ private:
             return width < static_cast<int>(sourceWidth * 0.90) ||
                 height < static_cast<int>(sourceHeight * 0.90);
         };
-        return isDownscaled(g_hwnd) || isDownscaled(g_pipHwnd);
+        return isDownscaled(g_hwnd) || isDownscaled(g_renderPipHwnd.load(std::memory_order_acquire));
     }
 
     bool UploadLatestFrame() {
@@ -2524,15 +2616,16 @@ private:
         d2d_->DrawText(value.c_str(), static_cast<UINT32>(value.size()), textFormat_.Get(), rect,
             white_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
     }
-    void DrawNoFrame(HWND hwnd) {
+    void DrawNoFrame(HWND hwnd, const RenderUiState& state) {
         RECT rc{}; GetClientRect(hwnd, &rc);
-        const std::wstring message = g_videoStatus.empty() ? Tr(TextId::VideoSelect) : g_videoStatus;
+        const std::wstring message = state.videoStatus.empty()
+            ? Tr(TextId::VideoSelect, state.language) : state.videoStatus;
         d2d_->DrawText(message.c_str(), static_cast<UINT32>(message.size()), statusFormat_.Get(),
             D2D1::RectF(20, 12, static_cast<float>(std::max<LONG>(20, rc.right - 20)),
                 static_cast<float>(std::max<LONG>(12, rc.bottom - 12))), white_.Get(),
             D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
     }
-    void DrawToolbar(HWND hwnd) {
+    void DrawToolbar(HWND hwnd, const RenderUiState& state) {
         RECT rc{}; GetClientRect(hwnd, &rc);
         const int width = rc.right;
         const int videoComboW = std::max(180, width / 3);
@@ -2540,17 +2633,17 @@ private:
         const int audioComboX = audioLabelX + 48;
         const int audioComboW = std::max(150, width - audioComboX - 315);
         const int resLabelX = audioComboX + audioComboW + 10;
-        Text(Tr(TextId::CaptureDeviceLabel), D2D1::RectF(12, 8, 96, 36));
-        Text(Tr(TextId::AudioLabel), D2D1::RectF(static_cast<float>(audioLabelX), 8, static_cast<float>(audioLabelX + 46), 36));
-        Text(Tr(TextId::ResolutionLabel), D2D1::RectF(static_cast<float>(resLabelX), 8, static_cast<float>(resLabelX + 82), 36));
-        Text(std::wstring(Tr(TextId::VolumeLabel)) + std::to_wstring(g_settings.volume) + L"%", D2D1::RectF(12, 48, 124, 80));
-        if (!g_statusText.empty()) Text(g_statusText, D2D1::RectF(600, 48, static_cast<float>(std::max(720, width - 12)), 80));
+        Text(Tr(TextId::CaptureDeviceLabel, state.language), D2D1::RectF(12, 8, 96, 36));
+        Text(Tr(TextId::AudioLabel, state.language), D2D1::RectF(static_cast<float>(audioLabelX), 8, static_cast<float>(audioLabelX + 46), 36));
+        Text(Tr(TextId::ResolutionLabel, state.language), D2D1::RectF(static_cast<float>(resLabelX), 8, static_cast<float>(resLabelX + 82), 36));
+        Text(std::wstring(Tr(TextId::VolumeLabel, state.language)) + std::to_wstring(state.volume) + L"%", D2D1::RectF(12, 48, 124, 80));
+        if (!state.statusText.empty()) Text(state.statusText, D2D1::RectF(600, 48, static_cast<float>(std::max(720, width - 12)), 80));
     }
-    void DrawStats(HWND hwnd) {
+    void DrawStats(HWND hwnd, const RenderUiState& state) {
         RECT rc{}; GetClientRect(hwnd, &rc);
-        std::wstring value = g_uiLanguage == UiLanguage::English
-            ? L"CAP " + std::to_wstring(g_captureFps) + L" FPS  |  RENDER " + std::to_wstring(g_renderFps) + L" FPS  |  DROPPED " + std::to_wstring(g_droppedFps)
-            : L"CAPTURA " + std::to_wstring(g_captureFps) + L" FPS  |  RENDER " + std::to_wstring(g_renderFps) + L" FPS  |  PERDIDOS " + std::to_wstring(g_droppedFps);
+        std::wstring value = state.language == UiLanguage::English
+            ? L"CAP " + std::to_wstring(state.captureFps) + L" FPS  |  PRESENT " + std::to_wstring(state.renderFps) + L" FPS  |  DROPPED " + std::to_wstring(state.droppedFps)
+            : L"CAPTURA " + std::to_wstring(state.captureFps) + L" FPS  |  PRESENTACIÓN " + std::to_wstring(state.renderFps) + L" FPS  |  PERDIDOS " + std::to_wstring(state.droppedFps);
         Text(value, D2D1::RectF(12, 84, static_cast<float>(std::max<LONG>(240, rc.right - 12)), 110));
     }
     void DrawPipOverlay(HWND hwnd) {
@@ -2761,8 +2854,8 @@ bool DrawCompatibilityPreview(HDC target, HWND window, bool compact) {
 
     if (!compact && g_settings.showPerformanceStats) {
         const std::wstring stats = g_uiLanguage == UiLanguage::English
-            ? L"CAP " + std::to_wstring(g_captureFps) + L" FPS  |  RENDER " + std::to_wstring(g_renderFps) + L" FPS  |  DROPPED " + std::to_wstring(g_droppedFps)
-            : L"CAPTURA " + std::to_wstring(g_captureFps) + L" FPS  |  RENDER " + std::to_wstring(g_renderFps) + L" FPS  |  PERDIDOS " + std::to_wstring(g_droppedFps);
+            ? L"CAP " + std::to_wstring(g_captureFps) + L" FPS  |  PRESENT " + std::to_wstring(g_renderFps) + L" FPS  |  DROPPED " + std::to_wstring(g_droppedFps)
+            : L"CAPTURA " + std::to_wstring(g_captureFps) + L" FPS  |  PRESENTACIÓN " + std::to_wstring(g_renderFps) + L" FPS  |  PERDIDOS " + std::to_wstring(g_droppedFps);
         DrawCompatibilityLabel(buffer.dc, g_uiFont, stats, RECT{ 12, 84, std::max(240, width - 12), 110 });
     }
     if (compact && g_pipHover) DrawPipHoverActions(buffer.dc, window);
@@ -2776,15 +2869,18 @@ bool DrawCompatibilityPreview(HDC target, HWND window, bool compact) {
 }
 
 void DestroyPaintBuffer(HWND hwnd) {
-    g_videoRenderer.DestroyTarget(hwnd);
+    // Swap-chain teardown is confined to the render thread. The main renderer
+    // is destroyed when that thread stops; PiP is reset on its next wakeup.
+    if (hwnd == g_pipHwnd) {
+        g_resetPipTargetRequested.store(true, std::memory_order_release);
+        SignalRenderRequest();
+    }
     if (hwnd == g_pipHwnd) DestroyGdiPaintBuffer(g_pipGdiBuffer);
     if (hwnd == g_hwnd) DestroyGdiPaintBuffer(g_mainGdiBuffer);
 }
 bool DrawPreview(HDC target, HWND window, bool compact = false) {
-    if (g_videoRenderer.Render(window, compact)) return true;
-    // Do not leave the user with a blank preview if D3D11/DXGI is unavailable
-    // or rejected by the installed graphics driver. The GDI path is slower but
-    // deliberately retained as a compatibility safety net.
+    // D3D11 presentation belongs exclusively to the render thread. WM_PAINT
+    // uses this compatibility path only while the D3D renderer is unavailable.
     return DrawCompatibilityPreview(target, window, compact);
 }
 
@@ -2799,29 +2895,79 @@ void DrawRendererFallback(HDC dc, HWND hwnd) {
         DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
 }
 
-// Called by the message pump when the frame-ready event is signaled. It is
-// deliberately not invoked through a high-priority WM_APP message. The pump
-// dispatches ordinary input/window messages first, then renders the newest
-// available frame once. A busy capture device therefore cannot monopolize the
-// UI queue or make the window appear hung.
-void RenderLatestVideoFrame() {
-    auto renderWindowNow = [](HWND target, bool compact) {
-        if (!target || !IsWindow(target) || !IsWindowVisible(target) || IsIconic(target)) return;
-        if (g_videoRenderer.Render(target, compact)) {
-            ValidateRect(target, nullptr);
-        } else {
-            // Let the normal low-priority WM_PAINT path draw the compatibility
-            // GDI frame. UpdateWindow() is intentionally avoided here because
-            // it would synchronously re-enter painting from the frame pump.
-            InvalidateVideoSurface(target);
+// D3D11, DXGI and the single-threaded Direct2D device context are owned by
+// this worker alone. The UI thread remains free to run menus, dialogs, resize
+// handling and cursor timers while capture frames continue to be presented.
+void RenderWorkerMain() {
+    const HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    HANDLE waits[] = { g_renderStopEvent, g_frameReadyEvent, g_renderRequestEvent };
+    bool fallbackInvalidated = false;
+
+    for (;;) {
+        const DWORD waitResult = WaitForMultipleObjects(
+            static_cast<DWORD>(std::size(waits)), waits, FALSE, INFINITE);
+        if (waitResult == WAIT_OBJECT_0) break;
+        if (waitResult == WAIT_FAILED) {
+            Log(L"Render worker wait failed; error=" + std::to_wstring(GetLastError()));
+            break;
         }
-    };
-    renderWindowNow(g_hwnd, false);
-    if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) renderWindowNow(g_pipHwnd, true);
+        if (waitResult != WAIT_OBJECT_0 + 1 && waitResult != WAIT_OBJECT_0 + 2) continue;
+
+        if (g_clearRendererFrameRequested.exchange(false, std::memory_order_acq_rel))
+            g_videoRenderer.ClearFrame();
+        if (g_resetPipTargetRequested.exchange(false, std::memory_order_acq_rel))
+            g_videoRenderer.DestroyPipTarget();
+
+        const RenderUiState state = GetRendererUiState();
+        HWND mainWindow = g_hwnd;
+        HWND pipWindow = g_renderPipHwnd.load(std::memory_order_acquire);
+        bool hasVisibleTarget = false;
+        bool renderSucceeded = false;
+        bool renderFailed = false;
+
+        if (mainWindow && IsWindow(mainWindow) && IsWindowVisible(mainWindow) && !IsIconic(mainWindow)) {
+            hasVisibleTarget = true;
+            if (g_videoRenderer.Render(mainWindow, false, state)) renderSucceeded = true;
+            else renderFailed = true;
+        }
+
+        if (pipWindow && IsWindow(pipWindow) && IsWindowVisible(pipWindow)) {
+            hasVisibleTarget = true;
+            if (g_videoRenderer.Render(pipWindow, true, state)) renderSucceeded = true;
+            else renderFailed = true;
+        }
+
+        if (renderFailed) {
+            g_d3dRendererActive.store(false, std::memory_order_release);
+            // D3D has failed. Invalidate through Win32 so the UI thread paints
+            // the retained GDI compatibility renderer without sharing D3D state.
+            if (!fallbackInvalidated || waitResult == WAIT_OBJECT_0 + 1) {
+                if (mainWindow && IsWindow(mainWindow)) InvalidateRect(mainWindow, nullptr, FALSE);
+                if (pipWindow && IsWindow(pipWindow)) InvalidateRect(pipWindow, nullptr, FALSE);
+                fallbackInvalidated = true;
+            }
+        } else if (hasVisibleTarget && renderSucceeded) {
+            g_d3dRendererActive.store(true, std::memory_order_release);
+            fallbackInvalidated = false;
+        }
+
+    }
+
+    g_videoRenderer.Destroy();
+    g_d3dRendererActive.store(false, std::memory_order_release);
+    if (SUCCEEDED(comHr)) CoUninitialize();
+}
+
+void StopRenderThread() {
+    if (!g_renderThread.joinable()) return;
+    if (g_renderStopEvent) SetEvent(g_renderStopEvent);
+    g_renderThread.join();
 }
 
 void InvalidateVideoSurface(HWND target) {
     if (!target || !IsWindow(target)) return;
+    PublishRendererUiState();
+    SignalRenderRequest();
     RECT area{};
     GetClientRect(target, &area);
     if (area.top < area.bottom) InvalidateRect(target, &area, FALSE);
@@ -2940,7 +3086,7 @@ bool PointInPipActionButton(HWND hwnd, POINT point) {
 void UpdatePipHover(HWND hwnd, bool hovered) {
     if (g_pipHover == hovered) return;
     g_pipHover = hovered;
-    InvalidateRect(hwnd, nullptr, FALSE);
+    InvalidateVideoSurface(hwnd);
 }
 
 void UpdatePipHoverFromCursor(HWND hwnd) {
@@ -3024,14 +3170,15 @@ LRESULT CALLBACK PipWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
-        if (!DrawPreview(dc, hwnd, true)) DrawRendererFallback(dc, hwnd);
+        if (!g_d3dRendererActive.load(std::memory_order_acquire) &&
+            !DrawPreview(dc, hwnd, true)) DrawRendererFallback(dc, hwnd);
         EndPaint(hwnd, &ps);
         return 0;
     }
     case WM_ERASEBKGND:
         return 1;
     case WM_SIZE:
-        InvalidateRect(hwnd, nullptr, FALSE);
+        InvalidateVideoSurface(hwnd);
         return 0;
     case WM_GETMINMAXINFO: {
         auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
@@ -3138,7 +3285,10 @@ LRESULT CALLBACK PipWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
         return 0;
     case WM_DESTROY:
         DestroyPaintBuffer(hwnd);
-        if (g_pipHwnd == hwnd) g_pipHwnd = nullptr;
+        if (g_pipHwnd == hwnd) {
+            g_pipHwnd = nullptr;
+            g_renderPipHwnd.store(nullptr, std::memory_order_release);
+        }
         return 0;
     }
     return DefWindowProcW(hwnd, message, wParam, lParam);
@@ -3160,11 +3310,13 @@ void TogglePictureInPicture() {
             MessageBoxW(g_hwnd, Tr(TextId::PipCreateFailed), L"PlayView", MB_OK | MB_ICONERROR);
             return;
         }
+        g_renderPipHwnd.store(g_pipHwnd, std::memory_order_release);
     }
     if (g_pipAlwaysOnTop) SetWindowPos(g_pipHwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     else SetWindowPos(g_pipHwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     ShowWindow(g_pipHwnd, SW_SHOWNOACTIVATE);
     UpdateWindow(g_pipHwnd);
+    InvalidateVideoSurface(g_pipHwnd);
 }
 
 LRESULT CALLBACK AboutWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -3289,12 +3441,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_MOUSEMOVE: {
         TRACKMOUSEEVENT tracking{ sizeof(tracking), TME_LEAVE, hwnd, 0 };
         TrackMouseEvent(&tracking);
+        ShowMainCursor();
         UpdateOverlayVisibility(false);
         return 0;
     }
     case WM_MOUSELEAVE:
+        KillTimer(hwnd, TIMER_CURSOR_AUTO_HIDE);
+        if (g_mainCursorHidden) {
+            g_mainCursorHidden = false;
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        }
         UpdateOverlayVisibility(false);
         return 0;
+    case WM_SETCURSOR:
+        if (g_mainCursorHidden && LOWORD(lParam) == HTCLIENT) {
+            SetCursor(nullptr);
+            return TRUE;
+        }
+        break;
     case WM_SIZE:
         if (!g_isChangingWindowMode && g_windowMode == 0) {
             if (wParam == SIZE_MAXIMIZED) g_windowMaximized = true;
@@ -3302,6 +3466,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 g_windowMaximized = IsZoomed(hwnd) != FALSE;
         }
         LayoutControls(LOWORD(lParam), HIWORD(lParam));
+        InvalidateVideoSurface(hwnd);
         return 0;
     case WM_EXITSIZEMOVE:
         CaptureNormalWindowPlacement();
@@ -3440,7 +3605,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         break;
     }
     case WM_ACTIVATE:
-        if (LOWORD(wParam) == WA_INACTIVE) HideVolumeTooltip();
+        if (LOWORD(wParam) == WA_INACTIVE) {
+            HideVolumeTooltip();
+            KillTimer(hwnd, TIMER_CURSOR_AUTO_HIDE);
+            if (g_mainCursorHidden) {
+                g_mainCursorHidden = false;
+                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            }
+        } else {
+            ShowMainCursor();
+        }
         break;
     case WM_CANCELMODE:
     case WM_CAPTURECHANGED:
@@ -3472,7 +3646,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         if (wParam == VK_ESCAPE && g_windowMode == 2) { SetWindowMode(0); return 0; }
         break;
     case WM_APP_CLEAR_FRAME:
-        g_videoRenderer.ClearFrame();
+        g_clearRendererFrameRequested.store(true, std::memory_order_release);
+        SignalRenderRequest();
         ClearCompatibilityFrame();
         InvalidateVideoSurface(hwnd);
         if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) InvalidateVideoSurface(g_pipHwnd);
@@ -3504,7 +3679,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         g_videoHasFrame.store(false);
         g_nextVideoRetry = GetTickCount64() + 4000;
         ClearQueuedFrames();
-        g_videoRenderer.ClearFrame();
+        g_clearRendererFrameRequested.store(true, std::memory_order_release);
+        SignalRenderRequest();
         ClearCompatibilityFrame();
         UpdateStatusText();
         InvalidateVideoSurface(hwnd);
@@ -3516,6 +3692,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         UpdateStatusText();
         return 0;
     case WM_TIMER:
+        if (wParam == TIMER_CURSOR_AUTO_HIDE) {
+            TryHideMainCursor();
+            KillTimer(hwnd, TIMER_CURSOR_AUTO_HIDE);
+            return 0;
+        }
         if (wParam == TIMER_STATS) {
             const ULONGLONG now = GetTickCount64();
             const ULONGLONG elapsed = (g_statsLastTick > 0 && now > g_statsLastTick)
@@ -3582,7 +3763,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
-        if (!DrawPreview(dc, hwnd, false)) DrawRendererFallback(dc, hwnd);
+        if (!g_d3dRendererActive.load(std::memory_order_acquire) &&
+            !DrawPreview(dc, hwnd, false)) DrawRendererFallback(dc, hwnd);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -3615,10 +3797,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_CLOSE:
         KillTimer(hwnd, TIMER_RECONNECT);
         KillTimer(hwnd, TIMER_STATS);
+        KillTimer(hwnd, TIMER_CURSOR_AUTO_HIDE);
         if (g_aboutHwnd && IsWindow(g_aboutHwnd)) DestroyWindow(g_aboutHwnd);
-        if (g_pipHwnd) DestroyWindow(g_pipHwnd);
         g_videoCapture.Stop();
         g_audioCapture.Stop();
+        StopRenderThread();
+        if (g_pipHwnd) DestroyWindow(g_pipHwnd);
         SaveSettings();
         DestroyWindow(hwnd);
         return 0;
@@ -3626,11 +3810,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         SaveSettings();
         KillTimer(hwnd, TIMER_RECONNECT);
         KillTimer(hwnd, TIMER_STATS);
+        KillTimer(hwnd, TIMER_CURSOR_AUTO_HIDE);
         if (g_aboutHwnd && IsWindow(g_aboutHwnd)) DestroyWindow(g_aboutHwnd);
-        if (g_pipHwnd && IsWindow(g_pipHwnd)) DestroyWindow(g_pipHwnd);
         g_videoCapture.Stop();
         g_audioCapture.Stop();
-        g_videoRenderer.Destroy();
+        StopRenderThread();
+        if (g_pipHwnd && IsWindow(g_pipHwnd)) DestroyWindow(g_pipHwnd);
         DestroyGdiPaintBuffer(g_mainGdiBuffer);
         DestroyGdiPaintBuffer(g_pipGdiBuffer);
         ClearCompatibilityFrame();
@@ -3679,13 +3864,17 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         return 1;
     }
 
-    // Auto-reset event coalesces 60 FPS frame notifications without filling
-    // the Win32 posted-message queue. The UI message loop handles input first
-    // and renders only the latest frame when this event is signaled.
+    // Auto-reset event coalesces capture notifications for the dedicated
+    // render worker without filling the Win32 posted-message queue.
     g_frameReadyEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!g_frameReadyEvent) {
-        MessageBoxW(nullptr, L"Could not create the video frame event.",
+    g_renderRequestEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_renderStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_frameReadyEvent || !g_renderRequestEvent || !g_renderStopEvent) {
+        MessageBoxW(nullptr, L"Could not create the video rendering events.",
             L"PlayView", MB_OK | MB_ICONERROR);
+        if (g_frameReadyEvent) CloseHandle(g_frameReadyEvent);
+        if (g_renderRequestEvent) CloseHandle(g_renderRequestEvent);
+        if (g_renderStopEvent) CloseHandle(g_renderStopEvent);
         MFShutdown();
         if (SUCCEEDED(comHr)) CoUninitialize();
         return 1;
@@ -3727,6 +3916,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     wc.lpszClassName = kWindowClass;
     if (!RegisterClassExW(&wc)) {
         if (g_frameReadyEvent) { CloseHandle(g_frameReadyEvent); g_frameReadyEvent = nullptr; }
+        if (g_renderRequestEvent) { CloseHandle(g_renderRequestEvent); g_renderRequestEvent = nullptr; }
+        if (g_renderStopEvent) { CloseHandle(g_renderStopEvent); g_renderStopEvent = nullptr; }
         MFShutdown();
         if (SUCCEEDED(comHr)) CoUninitialize();
         return 1;
@@ -3737,6 +3928,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         CW_USEDEFAULT, CW_USEDEFAULT, 1180, 760, nullptr, nullptr, instance, nullptr);
     if (!hwnd) {
         if (g_frameReadyEvent) { CloseHandle(g_frameReadyEvent); g_frameReadyEvent = nullptr; }
+        if (g_renderRequestEvent) { CloseHandle(g_renderRequestEvent); g_renderRequestEvent = nullptr; }
+        if (g_renderStopEvent) { CloseHandle(g_renderStopEvent); g_renderStopEvent = nullptr; }
         MFShutdown();
         if (SUCCEEDED(comHr)) CoUninitialize();
         return 1;
@@ -3771,6 +3964,26 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         UpdateOverlayVisibility(true);
     }
 
+    PublishRendererUiState();
+    try {
+        g_renderThread = std::thread(RenderWorkerMain);
+    } catch (const std::exception&) {
+        Log(L"Could not start the render worker.");
+        MessageBoxW(hwnd, L"Could not start PlayView's video rendering thread.",
+            L"PlayView", MB_OK | MB_ICONERROR);
+        g_videoCapture.Stop();
+        g_audioCapture.Stop();
+        DestroyWindow(hwnd);
+        g_videoCapture.ShutdownAndWait();
+        if (g_frameReadyEvent) { CloseHandle(g_frameReadyEvent); g_frameReadyEvent = nullptr; }
+        if (g_renderRequestEvent) { CloseHandle(g_renderRequestEvent); g_renderRequestEvent = nullptr; }
+        if (g_renderStopEvent) { CloseHandle(g_renderStopEvent); g_renderStopEvent = nullptr; }
+        MFShutdown();
+        if (SUCCEEDED(comHr)) CoUninitialize();
+        return 1;
+    }
+    SignalRenderRequest();
+
     ACCEL acceleratorEntries[] = {
         { FVIRTKEY | FNOINVERT, VK_F5, IDC_RELOAD },
         { FVIRTKEY | FNOINVERT, VK_F11, IDM_VIEW_FULLSCREEN },
@@ -3780,51 +3993,31 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     HACCEL accelerators = CreateAcceleratorTableW(acceleratorEntries, static_cast<int>(std::size(acceleratorEntries)));
 
     MSG message{};
-    bool quitRequested = false;
     int exitCode = 0;
-    HANDLE frameEvent = g_frameReadyEvent;
-    while (!quitRequested) {
-        const DWORD waitResult = MsgWaitForMultipleObjectsEx(
-            1, &frameEvent, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-        if (waitResult == WAIT_FAILED) {
-            Log(L"MsgWaitForMultipleObjectsEx failed; error=" + std::to_wstring(GetLastError()));
-            break;
+    BOOL messageResult = FALSE;
+    while ((messageResult = GetMessageW(&message, nullptr, 0, 0)) > 0) {
+        // Keep the UI message loop independent from capture and presentation.
+        // Menus use their own modal loop, but the render worker continues to
+        // consume frame events and present while those menus are open.
+        if (g_aboutHwnd && IsDialogMessageW(g_aboutHwnd, &message)) continue;
+        if (!accelerators || !TranslateAcceleratorW(hwnd, accelerators, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
         }
-
-        // Drain a bounded batch. This gives mouse, keyboard, menus, minimize,
-        // close and dialog messages priority over continuous capture frames,
-        // while still guaranteeing that a busy input queue cannot starve video.
-        for (unsigned int processed = 0; processed < 64; ++processed) {
-            if (!PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) break;
-            if (message.message == WM_QUIT) {
-                exitCode = static_cast<int>(message.wParam);
-                quitRequested = true;
-                break;
-            }
-            // The About window is modeless, so route its keyboard navigation
-            // through the dialog manager without blocking the main message loop.
-            if (g_aboutHwnd && IsDialogMessageW(g_aboutHwnd, &message)) continue;
-            if (!accelerators || !TranslateAcceleratorW(hwnd, accelerators, &message)) {
-                TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
-        }
-        if (quitRequested) break;
-
-        // The wait consumes the auto-reset event if it caused the wake. Also
-        // check once after dispatch: a frame may have arrived while handling
-        // user input. Multiple signals collapse into one render of the newest
-        // slot, never an unbounded stream of high-priority window messages.
-        const bool frameSignaled = (waitResult == WAIT_OBJECT_0) ||
-            (WaitForSingleObject(frameEvent, 0) == WAIT_OBJECT_0);
-        if (frameSignaled && HasQueuedReadyFrame()) RenderLatestVideoFrame();
+    }
+    if (messageResult == -1) {
+        Log(L"GetMessageW failed; error=" + std::to_wstring(GetLastError()));
+        exitCode = 1;
     }
     if (accelerators) DestroyAcceleratorTable(accelerators);
 
     g_videoCapture.Stop();
+    StopRenderThread();
     g_videoCapture.ShutdownAndWait();
     g_audioCapture.Stop();
     if (g_frameReadyEvent) { CloseHandle(g_frameReadyEvent); g_frameReadyEvent = nullptr; }
+    if (g_renderRequestEvent) { CloseHandle(g_renderRequestEvent); g_renderRequestEvent = nullptr; }
+    if (g_renderStopEvent) { CloseHandle(g_renderStopEvent); g_renderStopEvent = nullptr; }
     MFShutdown();
     if (SUCCEEDED(comHr)) CoUninitialize();
     return exitCode;
