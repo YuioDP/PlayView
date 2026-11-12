@@ -2234,12 +2234,12 @@ class VideoRenderer {
     struct WindowTarget {
         HWND hwnd = nullptr;
         ComPtr<IDXGISwapChain3> swapChain;
-        // Keep views for each flip-model back buffer. Recreating COM views on
-        // every frame adds avoidable CPU overhead and can stall presentation.
-        // Three flip-model back buffers reduce stalls while DWM is composing
-        // windowed presentation and keep a fresh frame available for each vblank.
-        std::array<ComPtr<ID3D11RenderTargetView>, 3> rtvs;
-        std::array<ComPtr<ID2D1Bitmap1>, 3> d2dTargets;
+        // With a D3D11 flip-model swap chain, the application renders through
+        // buffer index 0. DXGI rotates the underlying buffer identity after
+        // Present; requesting indices 1+ is not a valid D3D11 render-target
+        // path for this flip-discard chain. Keep one RTV and one D2D target.
+        ComPtr<ID3D11RenderTargetView> rtv;
+        ComPtr<ID2D1Bitmap1> d2dTarget;
         UINT width = 0, height = 0;
     };
 public:
@@ -2257,16 +2257,14 @@ public:
         if (!UploadLatestFrame()) { DisableAfterFailure(); return false; }
         const bool hasNewMainFrame = !compact && lastUploadedSequence_ > sequenceBeforeUpload;
 
-        const UINT bufferIndex = t.swapChain->GetCurrentBackBufferIndex();
-        if (bufferIndex >= static_cast<UINT>(t.rtvs.size()) ||
-            !t.rtvs[bufferIndex] || !t.d2dTargets[bufferIndex]) {
-            SetFailure(L"DXGI current back-buffer/view lookup", E_FAIL);
+        if (!t.rtv || !t.d2dTarget) {
+            SetFailure(L"DXGI buffer-0 render-target lookup", E_FAIL);
             DisableAfterFailure();
             return false;
         }
 
         const float clear[4] = { 0.027f, 0.039f, 0.063f, 1.0f };
-        ID3D11RenderTargetView* rtv = t.rtvs[bufferIndex].Get();
+        ID3D11RenderTargetView* rtv = t.rtv.Get();
         context_->OMSetRenderTargets(1, &rtv, nullptr);
         context_->ClearRenderTargetView(rtv, clear);
 
@@ -2300,7 +2298,7 @@ public:
 
         // Direct2D draws the controls and text onto the same DXGI back buffer.
         context_->OMSetRenderTargets(0, nullptr, nullptr);
-        d2d_->SetTarget(t.d2dTargets[bufferIndex].Get());
+        d2d_->SetTarget(t.d2dTarget.Get());
         d2d_->BeginDraw();
         d2d_->SetTransform(D2D1::Matrix3x2F::Identity());
         if (!frameView_) DrawNoFrame(hwnd, state);
@@ -2491,7 +2489,7 @@ private:
             desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
             desc.SampleDesc.Count = 1;
             desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-            desc.BufferCount = static_cast<UINT>(t.rtvs.size()); // 3 buffers for composed-window pacing
+            desc.BufferCount = 3; // Triple buffering; D3D11 rendering still uses GetBuffer(0).
             desc.Scaling = DXGI_SCALING_STRETCH;
             desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
             desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
@@ -2512,33 +2510,49 @@ private:
             // All references to swap-chain buffers must be released before
             // ResizeBuffers. Recreate the views only when the client size changes.
             d2d_->SetTarget(nullptr);
-            for (auto& target : t.d2dTargets) target.Reset();
-            for (auto& view : t.rtvs) view.Reset();
+            t.d2dTarget.Reset();
+            t.rtv.Reset();
             HRESULT hr = t.swapChain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
             if (FAILED(hr)) { SetFailure(L"IDXGISwapChain::ResizeBuffers", hr); return false; }
             t.width = w;
             t.height = h;
         }
 
-        for (UINT index = 0; index < static_cast<UINT>(t.rtvs.size()); ++index) {
-            if (t.rtvs[index] && t.d2dTargets[index]) continue;
+        if (!t.rtv || !t.d2dTarget) {
+            // For a D3D11 flip-model swap chain, GetBuffer(0) is the app's
+            // render-target entry point. The runtime rotates the buffer-0
+            // identity across Present calls; buffers 1+ are not individually
+            // exposed for rendering with FLIP_DISCARD.
             ComPtr<ID3D11Texture2D> backBuffer;
-            HRESULT hr = t.swapChain->GetBuffer(index, IID_PPV_ARGS(&backBuffer));
-            if (SUCCEEDED(hr))
-                hr = device_->CreateRenderTargetView(backBuffer.Get(), nullptr, &t.rtvs[index]);
-            ComPtr<IDXGISurface> surface;
-            if (SUCCEEDED(hr)) hr = backBuffer.As(&surface);
-            if (SUCCEEDED(hr)) {
-                const auto props = D2D1::BitmapProperties1(
-                    D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
-                    96.0f, 96.0f);
-                hr = d2d_->CreateBitmapFromDxgiSurface(surface.Get(), &props, &t.d2dTargets[index]);
-            }
+            HRESULT hr = t.swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
             if (FAILED(hr)) {
-                t.d2dTargets[index].Reset();
-                t.rtvs[index].Reset();
-                SetFailure(L"Create swap-chain back-buffer views/Direct2D target", hr);
+                SetFailure(L"IDXGISwapChain::GetBuffer(0)", hr);
+                return false;
+            }
+
+            hr = device_->CreateRenderTargetView(backBuffer.Get(), nullptr, &t.rtv);
+            if (FAILED(hr)) {
+                SetFailure(L"ID3D11Device::CreateRenderTargetView(buffer 0)", hr);
+                return false;
+            }
+
+            ComPtr<IDXGISurface> surface;
+            hr = backBuffer.As(&surface);
+            if (FAILED(hr)) {
+                t.rtv.Reset();
+                SetFailure(L"QueryInterface IDXGISurface(buffer 0)", hr);
+                return false;
+            }
+
+            const auto props = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+                96.0f, 96.0f);
+            hr = d2d_->CreateBitmapFromDxgiSurface(surface.Get(), &props, &t.d2dTarget);
+            if (FAILED(hr)) {
+                t.d2dTarget.Reset();
+                t.rtv.Reset();
+                SetFailure(L"ID2D1DeviceContext::CreateBitmapFromDxgiSurface(buffer 0)", hr);
                 return false;
             }
         }
@@ -2625,8 +2639,8 @@ private:
     }
     void ResetTarget(WindowTarget& t) {
         if (d2d_) d2d_->SetTarget(nullptr);
-        for (auto& target : t.d2dTargets) target.Reset();
-        for (auto& view : t.rtvs) view.Reset();
+        t.d2dTarget.Reset();
+        t.rtv.Reset();
         t.swapChain.Reset();
         t.hwnd = nullptr;
         t.width = t.height = 0;
