@@ -1,4 +1,4 @@
-# PlayView 1.1.1 (English)
+# PlayView 1.2.0 (English)
 
 **PlayView** is a lightweight Windows capture-card monitor. It is designed to let you connect a game console, select the capture input, and play from a simple window without the extra features found in general-purpose media players.
 
@@ -21,6 +21,13 @@
 - **Fullscreen mode:** Toggle fullscreen with `F11`. When you exit, the previous window state is restored.
 - **Options bar:** In windowed mode, the bar can stay visible or appear when the pointer moves into the top area. In fullscreen mode, it appears and hides automatically as the pointer enters or leaves the top area, regardless of the windowed-mode preference.
 - Controls are overlaid on the video and do not reserve space inside the displayed image.
+
+### Performance and scaling
+
+- Uses Direct3D 11 to scale the captured image on the GPU with linear filtering and a generated mipmap chain for cleaner downscaling in windowed, fullscreen, and PiP modes. Drivers without mipmap-generation support use a single-level linear-filtered texture.
+- Reuses Direct3D render-target views and Direct2D back-buffer targets between paints, recreating them only when a window is resized.
+- Keeps capture and presentation decoupled through a three-slot frame exchange. If the UI falls behind, older queued frames are dropped rather than building up latency.
+- Optional performance statistics show captured FPS, unique video frames presented by the main window, and dropped frames. Enable them from **View → Show performance statistics**.
 
 ### Picture in Picture (PiP)
 
@@ -99,7 +106,9 @@ PlayView is written in C++20 and uses native Windows components:
 
 - Windows Media Foundation for video and audio device discovery and capture.
 - WinMM (`waveOut`) for captured-audio playback.
-- Win32 and GDI with double buffering for the interface and video presentation.
+- Direct3D 11 and DXGI flip-model swap chains for GPU video scaling and presentation, including mipmap-based downscaling.
+- Direct2D and DirectWrite for GPU-backed interface overlays and text.
+- An atomic three-slot frame exchange between the capture worker and the UI thread. Older ready frames are discarded when needed so the UI can display the newest available frame.
 - Windows Imaging Component for processing custom profile icons.
 
 PlayView does not use Electron and does not require VLC, FFmpeg, or another media player to be installed. The application statically links the C++ runtime; the multimedia APIs it uses are included with Windows.
@@ -113,11 +122,11 @@ PlayView does not use Electron and does not require VLC, FFmpeg, or another medi
 
 ---
 
-**PlayView 1.1.1** · A lightweight capture-card monitor for Windows.
+**PlayView 1.2.0** · A lightweight capture-card monitor for Windows.
 
 ---
 
-# PlayView 1.1.1 (Español)
+# PlayView 1.2.0 (Español)
 
 **PlayView** es un monitor ligero de capturadoras para Windows. Está diseñado para conectar una consola, seleccionar la entrada de captura y jugar desde una ventana sencilla, sin las funciones adicionales de los reproductores multimedia de propósito general.
 
@@ -140,6 +149,13 @@ PlayView does not use Electron and does not require VLC, FFmpeg, or another medi
 - **Pantalla completa:** permite alternar a pantalla completa con `F11`. Al salir, se restaura el estado anterior de la ventana.
 - **Barra de opciones:** en modo ventana, la barra puede permanecer visible o aparecer cuando el cursor se desplaza hacia la zona superior. En pantalla completa, aparece y se oculta automáticamente al entrar o salir el cursor de esa zona, independientemente de la preferencia del modo ventana.
 - Los controles se superponen al video y no reservan espacio dentro de la imagen mostrada.
+
+### Rendimiento y escalado
+
+- Utiliza Direct3D 11 para escalar la imagen mediante la GPU con filtrado lineal y una cadena de mipmaps generada para mejorar la reducción de tamaño en los modos ventana, pantalla completa y PiP. Los controladores que no admiten la generación de mipmaps utilizan una textura de un solo nivel con filtrado lineal.
+- Reutiliza las vistas de destino de Direct3D y los destinos de búfer de Direct2D entre repintados; solo los recrea cuando cambia el tamaño de una ventana.
+- Desacopla la captura y la presentación mediante un intercambio de tres búferes. Si la interfaz se retrasa, descarta fotogramas antiguos en lugar de acumular latencia.
+- Incluye estadísticas opcionales de FPS de captura, fotogramas de video únicos presentados por la ventana principal y fotogramas descartados. Se activan desde **Ver → Mostrar estadísticas de rendimiento**.
 
 ### Picture in Picture (PiP)
 
@@ -218,7 +234,9 @@ PlayView está desarrollado en C++20 y utiliza componentes nativos de Windows:
 
 - Windows Media Foundation para detectar dispositivos de video y audio y realizar la captura.
 - WinMM (`waveOut`) para reproducir el audio capturado.
-- Win32 y GDI con doble búfer para la interfaz y la presentación de video.
+- Direct3D 11 y swap chains DXGI flip-model para el escalado y la presentación de video mediante GPU, incluida la reducción de tamaño con mipmaps.
+- Direct2D y DirectWrite para las superposiciones y los textos de la interfaz acelerados por GPU.
+- Un intercambio atómico de fotogramas de tres búferes entre el hilo de captura y el hilo de interfaz. Cuando es necesario, se descartan fotogramas antiguos para que la interfaz muestre el más reciente disponible.
 - Windows Imaging Component para procesar los iconos personalizados de los perfiles.
 
 PlayView no utiliza Electron ni requiere tener instalado VLC, FFmpeg u otro reproductor multimedia. La aplicación enlaza estáticamente el runtime de C++; las API multimedia que utiliza están incluidas en Windows.
@@ -232,4 +250,4 @@ PlayView no utiliza Electron ni requiere tener instalado VLC, FFmpeg u otro repr
 
 ---
 
-**PlayView 1.1.1** · Un monitor ligero de capturadoras para Windows.
+**PlayView 1.2.0** · Un monitor ligero de capturadoras para Windows.

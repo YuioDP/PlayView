@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(PlayView VERSION 1.1.1 LANGUAGES CXX RC)
+project(PlayView VERSION 1.2.0 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -46,6 +46,11 @@ target_link_libraries(PlayView PRIVATE
     shell32
     comdlg32
     windowscodecs
+    d3d11
+    dxgi
+    d3dcompiler
+    d2d1
+    dwrite
     user32
     gdi32
 )

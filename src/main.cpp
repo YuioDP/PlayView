@@ -1,5 +1,12 @@
 #include <windows.h>
 #include <windowsx.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <dxgi1_4.h>
+#include <d3dcompiler.h>
+#include <d2d1_1.h>
+#include <d2d1helper.h>
+#include <dwrite.h>
 #include <commctrl.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -19,7 +26,6 @@
 #include <string>
 #include <vector>
 #include <thread>
-#include <mutex>
 #include <atomic>
 #include <deque>
 #include <algorithm>
@@ -28,6 +34,8 @@
 #include <cmath>
 #include <iterator>
 #include <memory>
+#include <utility>
+#include <array>
 #include <sstream>
 #include <iomanip>
 #include "resource.h"
@@ -52,8 +60,10 @@ constexpr UINT WM_APP_VIDEO_READY = WM_APP + 2;
 constexpr UINT WM_APP_VIDEO_LOST = WM_APP + 3;
 constexpr UINT WM_APP_AUDIO_LOST = WM_APP + 4;
 constexpr UINT WM_APP_REBUILD_MENU = WM_APP + 5;
+constexpr UINT WM_APP_CLEAR_FRAME = WM_APP + 6;
 constexpr UINT_PTR TIMER_RECONNECT = 1;
 constexpr UINT_PTR TIMER_OVERLAY = 2;
+constexpr UINT_PTR TIMER_STATS = 3;
 
 constexpr int IDC_VIDEO_DEVICE = 1001;
 constexpr int IDC_AUDIO_DEVICE = 1002;
@@ -80,6 +90,7 @@ constexpr int IDM_PIP_CLOSE = 2600;
 constexpr int IDM_LANGUAGE_AUTOMATIC = 2700;
 constexpr int IDM_LANGUAGE_SPANISH = 2701;
 constexpr int IDM_LANGUAGE_ENGLISH = 2702;
+constexpr int IDM_SHOW_PERFORMANCE_STATS = 2703;
 constexpr int ID_PROFILE_MENU_LIMIT = 100;
 
 enum class LanguagePreference : int { Automatic = 0, Spanish = 1, English = 2 };
@@ -87,7 +98,7 @@ enum class UiLanguage { Spanish, English };
 
 enum class TextId {
     VideoSelect, AudioUnconfigured,
-    SettingsMenu, LanguageMenu, LanguageAutomatic, LanguageSpanish, LanguageEnglish,
+    SettingsMenu, LanguageMenu, LanguageAutomatic, LanguageSpanish, LanguageEnglish, PerformanceStatsMenu,
     FileMenu, ViewMenu, HelpMenu, ShowToolbar, Exit,
     Windowed, Fullscreen, PipMenu, PipAlwaysOnTop, About,
     Profiles, SaveCurrentProfile, UseMainSettings, NoSavedProfiles,
@@ -107,7 +118,7 @@ enum class TextId {
     CapturesResynced, ReloadButton, PipButton, MuteButton, UnmuteButton,
     ResyncButton, CaptureDeviceLabel, AudioLabel, ResolutionLabel, VolumeLabel,
     HidePip, AlwaysOnTop, PipCreateFailed,
-    AboutBody, AboutTitle, MediaFoundationStartupError,
+    AboutBody, AboutTitle, MediaFoundationStartupError, RendererUnavailable,
     ShowPip, WindowTitleProfile
 };
 
@@ -124,6 +135,7 @@ const wchar_t* Tr(TextId id) {
     case TextId::LanguageAutomatic: return en ? L"Automatic (Windows display language)" : L"Automático (idioma de Windows)";
     case TextId::LanguageSpanish: return L"Español";
     case TextId::LanguageEnglish: return L"English";
+    case TextId::PerformanceStatsMenu: return en ? L"Show performance statistics" : L"Mostrar estadísticas de rendimiento";
     case TextId::FileMenu: return en ? L"File" : L"Archivo";
     case TextId::ViewMenu: return en ? L"View" : L"Ver";
     case TextId::HelpMenu: return en ? L"Help" : L"Ayuda";
@@ -194,7 +206,8 @@ const wchar_t* Tr(TextId id) {
     case TextId::HidePip: return en ? L"Hide Picture in Picture" : L"Ocultar imagen en imagen";
     case TextId::AlwaysOnTop: return en ? L"Always on top" : L"Siempre visible";
     case TextId::PipCreateFailed: return en ? L"Could not create the Picture in Picture window." : L"No se pudo crear la ventana de imagen en imagen.";
-    case TextId::AboutBody: return en ? L"PlayView 1.1.1\nA lightweight monitor for video capture devices.\n\nCapture powered by Windows Media Foundation." : L"PlayView 1.1.1\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation.";
+    case TextId::AboutBody: return en ? L"PlayView 1.2.0\nA lightweight monitor for video capture devices.\n\nCapture powered by Windows Media Foundation and Direct3D 11." : L"PlayView 1.2.0\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation y Direct3D 11.";
+    case TextId::RendererUnavailable: return en ? L"The Direct3D 11 renderer could not be initialized. Check playview.log for details." : L"No se pudo iniciar el renderizador Direct3D 11. Consulta playview.log para más detalles.";
     case TextId::AboutTitle: return en ? L"About PlayView" : L"Acerca de PlayView";
     case TextId::MediaFoundationStartupError: return en ? L"Could not initialize Windows Media Foundation. Make sure Windows is up to date." : L"No se pudo iniciar Windows Media Foundation. Comprueba que Windows esté actualizado.";
     case TextId::ShowPip: return en ? L"Show Picture in Picture" : L"Mostrar imagen en imagen";
@@ -236,6 +249,7 @@ struct Settings {
     bool muted = false;
     int windowMode = 0; // 0 windowed, 2 fullscreen (1 was the removed borderless mode)
     bool showToolbar = true;
+    bool showPerformanceStats = false;
     bool windowMaximized = false;
     int windowX = 100;
     int windowY = 100;
@@ -249,20 +263,18 @@ struct ProfileEntry {
     std::filesystem::path iconPath;
 };
 
-struct FrameData {
+// Three-slot lock-free frame exchange. The capture worker writes into a FREE
+// slot while the UI thread uploads the newest READY slot to the GPU. No frame
+// mutex is held during scaling, drawing, or presentation.
+enum class FrameSlotState : int { Free = 0, Writing = 1, Ready = 2, Reading = 3 };
+struct FrameSlot {
     std::vector<BYTE> pixels;
     int width = 0;
     int height = 0;
+    std::atomic_uint64_t sequence{ 0 };
+    std::atomic<int> state{ static_cast<int>(FrameSlotState::Free) };
 };
-
-struct PaintBuffer {
-    HDC dc = nullptr;
-    HBITMAP bitmap = nullptr;
-    HGDIOBJ previousBitmap = nullptr;
-    HBRUSH backgroundBrush = nullptr;
-    int width = 0;
-    int height = 0;
-};
+constexpr size_t kFrameSlotCount = 3;
 
 HWND g_hwnd = nullptr;
 HWND g_pipHwnd = nullptr;
@@ -276,16 +288,19 @@ std::wstring g_volumeTooltipText;
 bool g_volumeTooltipVisible = false;
 HFONT g_uiFont = nullptr;
 HMENU g_appMenu = nullptr;
-PaintBuffer g_mainPaintBuffer;
-PaintBuffer g_pipPaintBuffer;
 
 Settings g_settings;
 std::vector<DeviceInfo> g_videoDevices;
 std::vector<DeviceInfo> g_audioDevices;
 std::vector<VideoMode> g_videoModes;
-std::mutex g_frameMutex;
-FrameData g_latestFrame;
-std::vector<BYTE> g_pipDimFrameScratch;
+std::array<FrameSlot, kFrameSlotCount> g_frameSlots;
+std::atomic_uint64_t g_frameSequence{ 0 };
+std::atomic_uint64_t g_captureFramesInterval{ 0 };
+std::atomic_uint64_t g_renderFramesInterval{ 0 };
+std::atomic_uint64_t g_droppedFramesInterval{ 0 };
+int g_captureFps = 0;
+int g_renderFps = 0;
+int g_droppedFps = 0;
 std::atomic_bool g_frameMessagePending{ false };
 std::atomic_int g_volume{ 80 };
 std::atomic_bool g_muted{ false };
@@ -318,6 +333,67 @@ std::filesystem::path g_activeProfilePath;
 std::wstring g_activeProfileName;
 std::vector<ProfileEntry> g_profileMenuEntries;
 bool g_pipAlwaysOnTop = true;
+
+FrameSlot* AcquireFrameSlotForWrite() {
+    for (auto& slot : g_frameSlots) {
+        int expected = static_cast<int>(FrameSlotState::Free);
+        if (slot.state.compare_exchange_strong(expected, static_cast<int>(FrameSlotState::Writing),
+                std::memory_order_acq_rel)) return &slot;
+    }
+    // If the UI is briefly behind, replace the oldest queued frame rather
+    // than blocking capture. This is preferable to displaying stale frames.
+    FrameSlot* oldest = nullptr;
+    for (auto& slot : g_frameSlots) {
+        if (slot.state.load(std::memory_order_acquire) == static_cast<int>(FrameSlotState::Ready) &&
+            (!oldest || slot.sequence.load(std::memory_order_relaxed) < oldest->sequence.load(std::memory_order_relaxed))) oldest = &slot;
+    }
+    if (oldest) {
+        int expected = static_cast<int>(FrameSlotState::Ready);
+        if (oldest->state.compare_exchange_strong(expected, static_cast<int>(FrameSlotState::Writing),
+                std::memory_order_acq_rel)) {
+            g_droppedFramesInterval.fetch_add(1, std::memory_order_relaxed);
+            return oldest;
+        }
+    }
+    g_droppedFramesInterval.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+}
+
+FrameSlot* AcquireLatestFrameForRead() {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        FrameSlot* newest = nullptr;
+        for (auto& slot : g_frameSlots) {
+            if (slot.state.load(std::memory_order_acquire) == static_cast<int>(FrameSlotState::Ready) &&
+                (!newest || slot.sequence.load(std::memory_order_relaxed) > newest->sequence.load(std::memory_order_relaxed))) newest = &slot;
+        }
+        if (!newest) return nullptr;
+        int expected = static_cast<int>(FrameSlotState::Ready);
+        if (!newest->state.compare_exchange_strong(expected, static_cast<int>(FrameSlotState::Reading),
+                std::memory_order_acq_rel)) continue;
+        // Discard older frames that accumulated while the UI was busy.
+        for (auto& slot : g_frameSlots) {
+            if (&slot == newest) continue;
+            expected = static_cast<int>(FrameSlotState::Ready);
+            if (slot.state.compare_exchange_strong(expected, static_cast<int>(FrameSlotState::Free),
+                    std::memory_order_acq_rel))
+                g_droppedFramesInterval.fetch_add(1, std::memory_order_relaxed);
+        }
+        return newest;
+    }
+    return nullptr;
+}
+
+void ReleaseFrameSlot(FrameSlot* slot) {
+    if (slot) slot->state.store(static_cast<int>(FrameSlotState::Free), std::memory_order_release);
+}
+
+void ClearQueuedFrames() {
+    for (auto& slot : g_frameSlots) {
+        int expected = static_cast<int>(FrameSlotState::Ready);
+        slot.state.compare_exchange_strong(expected, static_cast<int>(FrameSlotState::Free),
+            std::memory_order_acq_rel);
+    }
+}
 
 void LoadLanguagePreference() {
     const int saved = GetPrivateProfileIntW(L"General", L"Language", 0, g_settingsPath.c_str());
@@ -428,6 +504,7 @@ void LoadSettingsFrom(const std::filesystem::path& path) {
     // safely migrate to the regular windowed mode.
     g_settings.windowMode = (savedWindowMode == 2) ? 2 : 0;
     g_settings.showToolbar = ReadIniInt(L"Window", L"ShowToolbar", 1) != 0;
+    g_settings.showPerformanceStats = ReadIniInt(L"Diagnostics", L"ShowPerformanceStats", 0) != 0;
     g_settings.windowMaximized = ReadIniInt(L"Window", L"Maximized", 0) != 0;
     g_settings.windowX = ReadIniInt(L"Window", L"X", 100);
     g_settings.windowY = ReadIniInt(L"Window", L"Y", 100);
@@ -464,6 +541,7 @@ void SaveSettingsTo(const std::filesystem::path& path) {
     WriteIniString(L"Audio", L"Muted", g_settings.muted ? L"1" : L"0");
     WriteIniString(L"Window", L"Mode", std::to_wstring(g_windowMode));
     WriteIniString(L"Window", L"ShowToolbar", g_settings.showToolbar ? L"1" : L"0");
+    WriteIniString(L"Diagnostics", L"ShowPerformanceStats", g_settings.showPerformanceStats ? L"1" : L"0");
     WriteIniString(L"Window", L"Maximized", g_windowMaximized ? L"1" : L"0");
     WriteIniString(L"Window", L"X", std::to_wstring(g_restoreRect.left));
     WriteIniString(L"Window", L"Y", std::to_wstring(g_restoreRect.top));
@@ -919,8 +997,9 @@ private:
         HRESULT hr = CreateMediaSource(deviceId, true, &source);
         if (SUCCEEDED(hr)) {
             ComPtr<IMFAttributes> readerAttributes;
-            hr = MFCreateAttributes(&readerAttributes, 2);
+            hr = MFCreateAttributes(&readerAttributes, 3);
             if (SUCCEEDED(hr)) hr = readerAttributes->SetUINT32(MF_LOW_LATENCY, TRUE);
+            if (SUCCEEDED(hr)) hr = readerAttributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
             // Keep the advanced Source Reader processor enabled for real-time
             // format conversion. It supports the conversion/deinterlace path
             // and can use a registered hardware video processor when available.
@@ -961,7 +1040,6 @@ private:
         }
 
         bool signaledReady = false;
-        FrameData nextFrame;
         while (!stopRequested_.load()) {
             DWORD streamIndex = 0, flags = 0;
             LONGLONG timestamp = 0;
@@ -985,14 +1063,29 @@ private:
             if (!sample) { Sleep(1); continue; }
 
             ComPtr<IMFMediaBuffer> buffer;
-            hr = sample->ConvertToContiguousBuffer(&buffer);
+            // Most UVC capture samples contain a single buffer. Avoid
+            // ConvertToContiguousBuffer (which may allocate and copy) on that
+            // common path; use it only for multi-buffer samples.
+            DWORD bufferCount = 0;
+            hr = sample->GetBufferCount(&bufferCount);
+            if (SUCCEEDED(hr) && bufferCount == 1)
+                hr = sample->GetBufferByIndex(0, &buffer);
+            else if (SUCCEEDED(hr))
+                hr = sample->ConvertToContiguousBuffer(&buffer);
             if (FAILED(hr)) continue;
+
+            FrameSlot* frameSlot = AcquireFrameSlotForWrite();
+            if (!frameSlot) continue;
             const size_t rowBytes = static_cast<size_t>(frameWidth) * 4;
             const size_t frameBytes = rowBytes * frameHeight;
-            nextFrame.width = static_cast<int>(frameWidth);
-            nextFrame.height = static_cast<int>(frameHeight);
-            if (nextFrame.pixels.size() != frameBytes) nextFrame.pixels.resize(frameBytes);
             bool copiedFrame = false;
+            try {
+                if (frameSlot->pixels.size() != frameBytes) frameSlot->pixels.resize(frameBytes);
+            } catch (...) {
+                ReleaseFrameSlot(frameSlot);
+                g_droppedFramesInterval.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
 
             // Prefer IMF2DBuffer::Lock2D. It supplies the actual first scanline
             // and signed pitch, avoiding assumptions about the driver's layout.
@@ -1003,7 +1096,7 @@ private:
                 if (SUCCEEDED(buffer2D->Lock2D(&scanline0, &pitch))) {
                     const size_t absPitch = static_cast<size_t>(pitch < 0 ? -static_cast<int64_t>(pitch) : pitch);
                     if (scanline0 && absPitch >= rowBytes && rowBytes <= MAXDWORD) {
-                        copiedFrame = SUCCEEDED(MFCopyImage(nextFrame.pixels.data(),
+                        copiedFrame = SUCCEEDED(MFCopyImage(frameSlot->pixels.data(),
                             static_cast<LONG>(rowBytes), scanline0, pitch,
                             static_cast<DWORD>(rowBytes), frameHeight));
                     }
@@ -1024,7 +1117,7 @@ private:
                     if (data && absStride >= rowBytes && currentLength >= requiredBytes) {
                         for (UINT32 row = 0; row < frameHeight; ++row) {
                             const UINT32 sourceRow = stride < 0 ? (frameHeight - 1 - row) : row;
-                            std::memcpy(nextFrame.pixels.data() + static_cast<size_t>(row) * rowBytes,
+                            std::memcpy(frameSlot->pixels.data() + static_cast<size_t>(row) * rowBytes,
                                 data + static_cast<size_t>(sourceRow) * absStride, rowBytes);
                         }
                         copiedFrame = true;
@@ -1034,14 +1127,11 @@ private:
             }
 
             if (copiedFrame) {
-                {
-                    std::lock_guard<std::mutex> lock(g_frameMutex);
-                    g_latestFrame.width = nextFrame.width;
-                    g_latestFrame.height = nextFrame.height;
-                    // Swap rather than resize/copy under the mutex. The UI can
-                    // finish drawing the previous frame before the next one is published.
-                    g_latestFrame.pixels.swap(nextFrame.pixels);
-                }
+                frameSlot->width = static_cast<int>(frameWidth);
+                frameSlot->height = static_cast<int>(frameHeight);
+                frameSlot->sequence.store(g_frameSequence.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+                frameSlot->state.store(static_cast<int>(FrameSlotState::Ready), std::memory_order_release);
+                g_captureFramesInterval.fetch_add(1, std::memory_order_relaxed);
                 g_videoHasFrame.store(true);
                 g_lastVideoFrameTick.store(GetTickCount64());
                 if (!signaledReady) {
@@ -1049,6 +1139,8 @@ private:
                     PostMessageW(notifyWindow, WM_APP_VIDEO_READY, 0, 0);
                 }
                 if (!g_frameMessagePending.exchange(true)) PostMessageW(notifyWindow, WM_APP_FRAME, 0, 0);
+            } else {
+                ReleaseFrameSlot(frameSlot);
             }
         }
 
@@ -1430,10 +1522,8 @@ void StartSelectedVideo(bool showErrorIfMissing = true) {
     g_videoHasFrame.store(false);
     g_videoStartTick = GetTickCount64();
     g_frameMessagePending.store(false);
-    {
-        std::lock_guard<std::mutex> lock(g_frameMutex);
-        g_latestFrame = {};
-    }
+    ClearQueuedFrames();
+    PostMessageW(g_hwnd, WM_APP_CLEAR_FRAME, 0, 0);
     if (g_settings.videoId.empty()) {
         g_videoStatus = Tr(TextId::VideoSelect);
     } else if (!ContainsDevice(g_videoDevices, g_settings.videoId)) {
@@ -1643,6 +1733,9 @@ void CreateAppMenu(HWND hwnd) {
     AppendMenuW(view, MF_STRING, IDM_VIEW_PIP, Tr(TextId::PipMenu));
     AppendMenuW(view, MF_STRING | (g_pipAlwaysOnTop ? MF_CHECKED : MF_UNCHECKED),
         IDM_PIP_TOPMOST, Tr(TextId::PipAlwaysOnTop));
+    AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(view, MF_STRING | (g_settings.showPerformanceStats ? MF_CHECKED : MF_UNCHECKED),
+        IDM_SHOW_PERFORMANCE_STATS, Tr(TextId::PerformanceStatsMenu));
 
     AppendMenuW(language, MF_STRING | (g_languagePreference == LanguagePreference::Automatic ? MF_CHECKED : MF_UNCHECKED),
         IDM_LANGUAGE_AUTOMATIC, Tr(TextId::LanguageAutomatic));
@@ -1764,151 +1857,428 @@ void LayoutControls(int width, int /*height*/) {
     InvalidateVideoSurface(g_hwnd);
 }
 
-void DestroyPaintBuffer(PaintBuffer& buffer) {
-    if (buffer.dc && buffer.previousBitmap) SelectObject(buffer.dc, buffer.previousBitmap);
-    if (buffer.bitmap) DeleteObject(buffer.bitmap);
-    if (buffer.dc) DeleteDC(buffer.dc);
-    if (buffer.backgroundBrush) DeleteObject(buffer.backgroundBrush);
-    buffer = {};
-}
+class VideoRenderer {
+    struct WindowTarget {
+        HWND hwnd = nullptr;
+        ComPtr<IDXGISwapChain3> swapChain;
+        // Keep views for both flip-model back buffers. Recreating COM views on
+        // every paint adds avoidable CPU overhead and can stall the UI thread.
+        std::array<ComPtr<ID3D11RenderTargetView>, 2> rtvs;
+        std::array<ComPtr<ID2D1Bitmap1>, 2> d2dTargets;
+        UINT width = 0, height = 0;
+    };
+public:
+    bool Render(HWND hwnd, bool compact) {
+        if (!EnsureDevice()) return false;
+        UploadLatestFrame();
+        WindowTarget& t = compact ? pipTarget_ : mainTarget_;
+        if (!EnsureTarget(t, hwnd)) return false;
 
-bool EnsurePaintBuffer(HDC reference, PaintBuffer& buffer, int width, int height) {
-    if (width <= 0 || height <= 0) return false;
-    if (!buffer.dc) buffer.dc = CreateCompatibleDC(reference);
-    if (!buffer.dc) return false;
-    if (buffer.bitmap && buffer.width == width && buffer.height == height)
-        return buffer.backgroundBrush != nullptr;
+        const UINT bufferIndex = t.swapChain->GetCurrentBackBufferIndex();
+        if (bufferIndex >= static_cast<UINT>(t.rtvs.size()) ||
+            !t.rtvs[bufferIndex] || !t.d2dTargets[bufferIndex]) return false;
 
-    if (buffer.bitmap) {
-        if (buffer.previousBitmap) SelectObject(buffer.dc, buffer.previousBitmap);
-        DeleteObject(buffer.bitmap);
-        buffer.bitmap = nullptr;
-        buffer.previousBitmap = nullptr;
+        const float clear[4] = { 0.027f, 0.039f, 0.063f, 1.0f };
+        ID3D11RenderTargetView* rtv = t.rtvs[bufferIndex].Get();
+        context_->OMSetRenderTargets(1, &rtv, nullptr);
+        context_->ClearRenderTargetView(rtv, clear);
+
+        if (frameView_ && frameWidth_ > 0 && frameHeight_ > 0) {
+            RECT rc{}; GetClientRect(hwnd, &rc);
+            const float cw = static_cast<float>(std::max<LONG>(1, rc.right));
+            const float ch = static_cast<float>(std::max<LONG>(1, rc.bottom));
+            const float srcAspect = static_cast<float>(frameWidth_) / static_cast<float>(frameHeight_);
+            const float dstAspect = cw / ch;
+            D3D11_VIEWPORT vp{};
+            if (dstAspect > srcAspect) {
+                vp.Height = ch; vp.Width = ch * srcAspect; vp.TopLeftX = (cw - vp.Width) * 0.5f;
+            } else {
+                vp.Width = cw; vp.Height = cw / srcAspect; vp.TopLeftY = (ch - vp.Height) * 0.5f;
+            }
+            vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
+            context_->RSSetViewports(1, &vp);
+            context_->RSSetState(rasterizer_.Get());
+            context_->IASetInputLayout(nullptr);
+            context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context_->VSSetShader(vs_.Get(), nullptr, 0);
+            context_->PSSetShader(ps_.Get(), nullptr, 0);
+            ID3D11ShaderResourceView* srv = frameView_.Get();
+            context_->PSSetShaderResources(0, 1, &srv);
+            ID3D11SamplerState* sampler = sampler_.Get();
+            context_->PSSetSamplers(0, 1, &sampler);
+            context_->Draw(3, 0);
+            ID3D11ShaderResourceView* nullSrv = nullptr;
+            context_->PSSetShaderResources(0, 1, &nullSrv);
+        }
+
+        // Direct2D draws the controls and text onto the same DXGI back buffer.
+        context_->OMSetRenderTargets(0, nullptr, nullptr);
+        d2d_->SetTarget(t.d2dTargets[bufferIndex].Get());
+        d2d_->BeginDraw();
+        d2d_->SetTransform(D2D1::Matrix3x2F::Identity());
+        if (!frameView_) DrawNoFrame(hwnd);
+        if (!compact && g_overlayVisible) DrawToolbar(hwnd);
+        if (!compact && g_settings.showPerformanceStats) DrawStats(hwnd);
+        if (compact && g_pipHover) DrawPipOverlay(hwnd);
+        const HRESULT drawHr = d2d_->EndDraw();
+        d2d_->SetTarget(nullptr);
+        if (FAILED(drawHr)) {
+            Log(L"Direct2D overlay rendering failed: " + std::to_wstring(static_cast<unsigned long>(drawHr)));
+            return false;
+        }
+
+        const HRESULT presentHr = t.swapChain->Present(compact ? 0 : 1, 0);
+        if (SUCCEEDED(presentHr) && !compact && lastUploadedSequence_ > lastCountedSequence_) {
+            g_renderFramesInterval.fetch_add(1, std::memory_order_relaxed);
+            lastCountedSequence_ = lastUploadedSequence_;
+        }
+        if (presentHr == DXGI_ERROR_DEVICE_REMOVED || presentHr == DXGI_ERROR_DEVICE_RESET) {
+            Log(L"Direct3D device was reset; renderer will be recreated.");
+            ResetDevice();
+            return false;
+        }
+        return SUCCEEDED(presentHr);
     }
-    buffer.bitmap = CreateCompatibleBitmap(reference, width, height);
-    if (!buffer.bitmap) return false;
-    buffer.previousBitmap = SelectObject(buffer.dc, buffer.bitmap);
-    if (!buffer.previousBitmap || buffer.previousBitmap == HGDI_ERROR) {
-        DeleteObject(buffer.bitmap);
-        buffer.bitmap = nullptr;
-        buffer.previousBitmap = nullptr;
-        return false;
+    void ClearFrame() {
+        frameView_.Reset();
+        frameTexture_.Reset();
+        frameWidth_ = frameHeight_ = 0;
+        frameHasMipmaps_ = false;
+        lastUploadedSequence_ = 0;
+        lastCountedSequence_ = 0;
     }
-    if (!buffer.backgroundBrush) buffer.backgroundBrush = CreateSolidBrush(RGB(7, 10, 16));
-    buffer.width = width;
-    buffer.height = height;
-    return buffer.backgroundBrush != nullptr;
-}
+    void DestroyTarget(HWND hwnd) {
+        if (mainTarget_.hwnd == hwnd) ResetTarget(mainTarget_);
+        if (pipTarget_.hwnd == hwnd) ResetTarget(pipTarget_);
+    }
+    void Destroy() {
+        ResetTarget(mainTarget_); ResetTarget(pipTarget_); ClearFrame();
+        d2d_.Reset(); d2dDevice_.Reset(); d2dFactory_.Reset(); dwrite_.Reset();
+        white_.Reset(); shadow_.Reset(); dim_.Reset(); button_.Reset(); cyan_.Reset(); red_.Reset();
+        textFormat_.Reset(); statusFormat_.Reset(); sampler_.Reset(); ps_.Reset(); vs_.Reset();
+        context_.Reset(); device_.Reset(); factory_.Reset(); initialized_ = false;
+    }
+private:
+    bool EnsureDevice() {
+        if (initialized_) return true;
+        const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_SINGLETHREADED;
+        const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
+        D3D_FEATURE_LEVEL obtained{};
+        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+            levels, static_cast<UINT>(std::size(levels)), D3D11_SDK_VERSION, &device_, &obtained, &context_);
+        if (hr == E_INVALIDARG) {
+            device_.Reset(); context_.Reset();
+            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+                levels + 1, static_cast<UINT>(std::size(levels) - 1), D3D11_SDK_VERSION, &device_, &obtained, &context_);
+        }
+        if (FAILED(hr)) {
+            device_.Reset(); context_.Reset();
+            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags,
+                levels + 1, static_cast<UINT>(std::size(levels) - 1), D3D11_SDK_VERSION, &device_, &obtained, &context_);
+        }
+        if (FAILED(hr)) { Log(L"Direct3D 11 initialization failed: " + std::to_wstring(static_cast<unsigned long>(hr))); return false; }
+        ComPtr<IDXGIDevice> dxgi;
+        hr = device_.As(&dxgi);
+        ComPtr<IDXGIAdapter> adapter;
+        if (SUCCEEDED(hr)) hr = dxgi->GetAdapter(&adapter);
+        if (SUCCEEDED(hr)) hr = adapter->GetParent(IID_PPV_ARGS(&factory_));
+        if (FAILED(hr)) return false;
 
-void DrawPreview(HDC target, HWND window, PaintBuffer& buffer, bool compact = false) {
-    RECT client{};
-    GetClientRect(window, &client);
-    const int width = client.right - client.left;
-    const int height = client.bottom - client.top;
-    if (!EnsurePaintBuffer(target, buffer, width, height)) return;
+        const char* shader =
+            "struct O{float4 p:SV_POSITION;float2 uv:TEXCOORD0;};"
+            "O VSMain(uint id:SV_VertexID){float2 p=id==0?float2(-1,1):(id==1?float2(-1,-3):float2(3,1));"
+            "O o;o.p=float4(p,0,1);o.uv=float2((p.x+1)*.5,(1-p.y)*.5);return o;}"
+            "Texture2D tex:register(t0);SamplerState smp:register(s0);"
+            "float4 PSMain(O i):SV_TARGET{return tex.Sample(smp,i.uv);}";
+        ComPtr<ID3DBlob> vsBlob, psBlob, errors;
+        hr = D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr, "VSMain", "vs_4_0",
+            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &errors);
+        if (SUCCEEDED(hr)) hr = D3DCompile(shader, std::strlen(shader), nullptr, nullptr, nullptr,
+            "PSMain", "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &errors);
+        if (SUCCEEDED(hr)) hr = device_->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &vs_);
+        if (SUCCEEDED(hr)) hr = device_->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &ps_);
+        if (FAILED(hr)) return false;
+        D3D11_SAMPLER_DESC sd{}; sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP; sd.MaxLOD = D3D11_FLOAT32_MAX;
+        hr = device_->CreateSamplerState(&sd, &sampler_);
+        if (FAILED(hr)) return false;
+        D3D11_RASTERIZER_DESC rd{};
+        rd.FillMode = D3D11_FILL_SOLID;
+        rd.CullMode = D3D11_CULL_NONE;
+        rd.DepthClipEnable = TRUE;
+        hr = device_->CreateRasterizerState(&rd, &rasterizer_);
+        if (FAILED(hr)) return false;
+        D2D1_FACTORY_OPTIONS options{};
+        hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1),
+            &options, reinterpret_cast<void**>(d2dFactory_.GetAddressOf()));
+        if (SUCCEEDED(hr)) hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+            reinterpret_cast<IUnknown**>(dwrite_.GetAddressOf()));
+        if (SUCCEEDED(hr)) hr = d2dFactory_->CreateDevice(dxgi.Get(), &d2dDevice_);
+        if (SUCCEEDED(hr)) hr = d2dDevice_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &d2d_);
+        if (SUCCEEDED(hr)) hr = dwrite_->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 15.0f, L"", &textFormat_);
+        if (SUCCEEDED(hr)) hr = dwrite_->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 17.0f, L"", &statusFormat_);
+        if (SUCCEEDED(hr)) hr = statusFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (SUCCEEDED(hr)) hr = statusFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        if (SUCCEEDED(hr)) hr = d2d_->CreateSolidColorBrush(D2D1::ColorF(0.96f,0.97f,0.99f,1), &white_);
+        if (SUCCEEDED(hr)) hr = d2d_->CreateSolidColorBrush(D2D1::ColorF(0,0,0,0.92f), &shadow_);
+        if (SUCCEEDED(hr)) hr = d2d_->CreateSolidColorBrush(D2D1::ColorF(0,0,0,0.56f), &dim_);
+        if (SUCCEEDED(hr)) hr = d2d_->CreateSolidColorBrush(D2D1::ColorF(0.12f,0.16f,0.22f,0.92f), &button_);
+        if (SUCCEEDED(hr)) hr = d2d_->CreateSolidColorBrush(D2D1::ColorF(0.32f,0.78f,0.95f,1), &cyan_);
+        if (SUCCEEDED(hr)) hr = d2d_->CreateSolidColorBrush(D2D1::ColorF(0.96f,0.36f,0.36f,1), &red_);
+        if (FAILED(hr)) return false;
+        initialized_ = true; return true;
+    }
+    bool EnsureTarget(WindowTarget& t, HWND hwnd) {
+        RECT rc{}; GetClientRect(hwnd, &rc);
+        const UINT w = static_cast<UINT>(std::max<LONG>(1, rc.right));
+        const UINT h = static_cast<UINT>(std::max<LONG>(1, rc.bottom));
+        if (!t.swapChain) {
+            DXGI_SWAP_CHAIN_DESC1 desc{};
+            desc.Width = w;
+            desc.Height = h;
+            desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            desc.SampleDesc.Count = 1;
+            desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+            desc.BufferCount = static_cast<UINT>(t.rtvs.size());
+            desc.Scaling = DXGI_SCALING_STRETCH;
+            desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+            desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+            ComPtr<IDXGISwapChain1> swapChain1;
+            HRESULT hr = factory_->CreateSwapChainForHwnd(device_.Get(), hwnd, &desc, nullptr, nullptr, &swapChain1);
+            if (FAILED(hr)) {
+                desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+                hr = factory_->CreateSwapChainForHwnd(device_.Get(), hwnd, &desc, nullptr, nullptr, &swapChain1);
+            }
+            if (SUCCEEDED(hr)) hr = swapChain1.As(&t.swapChain);
+            if (FAILED(hr)) return false;
+            factory_->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+            t.hwnd = hwnd;
+            t.width = w;
+            t.height = h;
+        } else if (t.width != w || t.height != h) {
+            // All references to swap-chain buffers must be released before
+            // ResizeBuffers. Recreate the views only when the client size changes.
+            d2d_->SetTarget(nullptr);
+            for (auto& target : t.d2dTargets) target.Reset();
+            for (auto& view : t.rtvs) view.Reset();
+            HRESULT hr = t.swapChain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+            if (FAILED(hr)) return false;
+            t.width = w;
+            t.height = h;
+        }
 
-    FillRect(buffer.dc, &client, buffer.backgroundBrush);
-    RECT area = client; // The toolbar is layered above the video, never reserved from its area.
-    bool hasFrame = false;
-    {
-        std::lock_guard<std::mutex> lock(g_frameMutex);
-        if (g_latestFrame.width > 0 && g_latestFrame.height > 0 && !g_latestFrame.pixels.empty()) {
-            hasFrame = true;
-            const int viewWidth = area.right - area.left;
-            const int viewHeight = area.bottom - area.top;
-            if (viewWidth > 0 && viewHeight > 0) {
-                const BYTE* framePixels = g_latestFrame.pixels.data();
-                if (compact && g_pipHover) {
-                    // Reuse a scratch buffer so hover does not allocate a new
-                    // full-frame vector on every paint. If memory is tight,
-                    // keep the live picture rather than failing the paint.
-                    try {
-                        g_pipDimFrameScratch.resize(g_latestFrame.pixels.size());
-                        std::copy(g_latestFrame.pixels.begin(), g_latestFrame.pixels.end(),
-                            g_pipDimFrameScratch.begin());
-                        for (size_t i = 0; i + 3 < g_pipDimFrameScratch.size(); i += 4) {
-                            g_pipDimFrameScratch[i] = static_cast<BYTE>((g_pipDimFrameScratch[i] * 45) / 100);
-                            g_pipDimFrameScratch[i + 1] = static_cast<BYTE>((g_pipDimFrameScratch[i + 1] * 45) / 100);
-                            g_pipDimFrameScratch[i + 2] = static_cast<BYTE>((g_pipDimFrameScratch[i + 2] * 45) / 100);
-                        }
-                        framePixels = g_pipDimFrameScratch.data();
-                    } catch (...) {
-                        framePixels = g_latestFrame.pixels.data();
-                    }
-                }
-                const double scale = std::min(static_cast<double>(viewWidth) / g_latestFrame.width,
-                                              static_cast<double>(viewHeight) / g_latestFrame.height);
-                const int drawWidth = std::max(1, static_cast<int>(g_latestFrame.width * scale));
-                const int drawHeight = std::max(1, static_cast<int>(g_latestFrame.height * scale));
-                const int x = area.left + (viewWidth - drawWidth) / 2;
-                const int y = area.top + (viewHeight - drawHeight) / 2;
-                BITMAPINFO bitmapInfo{};
-                bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-                bitmapInfo.bmiHeader.biWidth = g_latestFrame.width;
-                bitmapInfo.bmiHeader.biHeight = -g_latestFrame.height;
-                bitmapInfo.bmiHeader.biPlanes = 1;
-                bitmapInfo.bmiHeader.biBitCount = 32;
-                bitmapInfo.bmiHeader.biCompression = BI_RGB;
-                SetStretchBltMode(buffer.dc, COLORONCOLOR);
-                StretchDIBits(buffer.dc, x, y, drawWidth, drawHeight, 0, 0,
-                    g_latestFrame.width, g_latestFrame.height, framePixels,
-                    &bitmapInfo, DIB_RGB_COLORS, SRCCOPY);
+        for (UINT index = 0; index < static_cast<UINT>(t.rtvs.size()); ++index) {
+            if (t.rtvs[index] && t.d2dTargets[index]) continue;
+            ComPtr<ID3D11Texture2D> backBuffer;
+            HRESULT hr = t.swapChain->GetBuffer(index, IID_PPV_ARGS(&backBuffer));
+            if (SUCCEEDED(hr))
+                hr = device_->CreateRenderTargetView(backBuffer.Get(), nullptr, &t.rtvs[index]);
+            ComPtr<IDXGISurface> surface;
+            if (SUCCEEDED(hr)) hr = backBuffer.As(&surface);
+            if (SUCCEEDED(hr)) {
+                const auto props = D2D1::BitmapProperties1(
+                    D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+                    96.0f, 96.0f);
+                hr = d2d_->CreateBitmapFromDxgiSurface(surface.Get(), &props, &t.d2dTargets[index]);
+            }
+            if (FAILED(hr)) {
+                t.d2dTargets[index].Reset();
+                t.rtvs[index].Reset();
+                return false;
             }
         }
+        return true;
     }
-    if (!hasFrame) {
-        SetBkMode(buffer.dc, TRANSPARENT);
-        SetTextColor(buffer.dc, RGB(190, 205, 220));
-        HFONT oldFont = static_cast<HFONT>(SelectObject(buffer.dc, g_uiFont));
-        RECT textRect = area;
-        DrawTextW(buffer.dc, g_videoStatus.c_str(), -1, &textRect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        if (oldFont) SelectObject(buffer.dc, oldFont);
+    void UploadLatestFrame() {
+        FrameSlot* slot = AcquireLatestFrameForRead();
+        if (!slot) return;
+        const int w = slot->width;
+        const int h = slot->height;
+        if (w <= 0 || h <= 0 || slot->pixels.empty()) {
+            ReleaseFrameSlot(slot);
+            return;
+        }
+
+        if (!frameTexture_ || frameWidth_ != w || frameHeight_ != h) {
+            frameView_.Reset();
+            frameTexture_.Reset();
+            frameHasMipmaps_ = false;
+
+            UINT formatSupport = 0;
+            const bool canGenerateMipmaps =
+                SUCCEEDED(device_->CheckFormatSupport(DXGI_FORMAT_B8G8R8A8_UNORM, &formatSupport)) &&
+                (formatSupport & D3D11_FORMAT_SUPPORT_MIP_AUTOGEN) != 0;
+
+            D3D11_TEXTURE2D_DESC desc{};
+            desc.Width = static_cast<UINT>(w);
+            desc.Height = static_cast<UINT>(h);
+            desc.MipLevels = canGenerateMipmaps ? 0u : 1u;
+            desc.ArraySize = 1;
+            desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            desc.SampleDesc.Count = 1;
+            desc.Usage = D3D11_USAGE_DEFAULT;
+            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            desc.MiscFlags = 0;
+            if (canGenerateMipmaps) {
+                desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
+                desc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+            }
+            bool createdMipmaps = canGenerateMipmaps;
+
+            ComPtr<ID3D11Texture2D> newTexture;
+            ComPtr<ID3D11ShaderResourceView> newView;
+            HRESULT hr = device_->CreateTexture2D(&desc, nullptr, &newTexture);
+            if (SUCCEEDED(hr))
+                hr = device_->CreateShaderResourceView(newTexture.Get(), nullptr, &newView);
+
+            // If mipmap creation is rejected despite the format query, retry
+            // with a single-level texture and retain linear filtering.
+            if (FAILED(hr) && canGenerateMipmaps) {
+                newView.Reset();
+                newTexture.Reset();
+                desc.MipLevels = 1;
+                desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                desc.MiscFlags = 0;
+                createdMipmaps = false;
+                hr = device_->CreateTexture2D(&desc, nullptr, &newTexture);
+                if (SUCCEEDED(hr))
+                    hr = device_->CreateShaderResourceView(newTexture.Get(), nullptr, &newView);
+            }
+
+            if (FAILED(hr)) {
+                Log(L"Could not create the video texture: " + std::to_wstring(static_cast<unsigned long>(hr)));
+                ReleaseFrameSlot(slot);
+                return;
+            }
+            frameTexture_ = std::move(newTexture);
+            frameView_ = std::move(newView);
+            frameWidth_ = w;
+            frameHeight_ = h;
+            frameHasMipmaps_ = createdMipmaps;
+        }
+
+        context_->UpdateSubresource(frameTexture_.Get(), 0, nullptr, slot->pixels.data(),
+            static_cast<UINT>(w * 4), 0);
+        if (frameHasMipmaps_) context_->GenerateMips(frameView_.Get());
+        lastUploadedSequence_ = slot->sequence.load(std::memory_order_relaxed);
+        ReleaseFrameSlot(slot);
     }
-
-    // Toolbar captions are part of the video back buffer rather than opaque
-    // STATIC child windows. The live picture therefore remains visible around
-    // the controls without the previous gray rectangular background.
-    if (!compact && g_overlayVisible) {
-        HFONT oldFont = static_cast<HFONT>(SelectObject(buffer.dc, g_uiFont));
-        const int oldBkMode = SetBkMode(buffer.dc, TRANSPARENT);
-        auto drawLabel = [&](const std::wstring& text, RECT rect) {
-            RECT shadow = rect;
-            OffsetRect(&shadow, 1, 1);
-            SetTextColor(buffer.dc, RGB(0, 0, 0));
-            DrawTextW(buffer.dc, text.c_str(), -1, &shadow,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-            SetTextColor(buffer.dc, RGB(245, 248, 252));
-            DrawTextW(buffer.dc, text.c_str(), -1, &rect,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-        };
-
-        const int clientAreaWidth = area.right - area.left;
-        const int videoComboW = std::max(180, clientAreaWidth / 3);
+    void ResetTarget(WindowTarget& t) {
+        if (d2d_) d2d_->SetTarget(nullptr);
+        for (auto& target : t.d2dTargets) target.Reset();
+        for (auto& view : t.rtvs) view.Reset();
+        t.swapChain.Reset();
+        t.hwnd = nullptr;
+        t.width = t.height = 0;
+    }
+    void ResetDevice() {
+        ResetTarget(mainTarget_); ResetTarget(pipTarget_); ClearFrame();
+        d2d_.Reset(); d2dDevice_.Reset(); d2dFactory_.Reset(); dwrite_.Reset();
+        white_.Reset(); shadow_.Reset(); dim_.Reset(); button_.Reset(); cyan_.Reset(); red_.Reset();
+        textFormat_.Reset(); statusFormat_.Reset(); sampler_.Reset(); ps_.Reset(); vs_.Reset();
+        context_.Reset(); device_.Reset(); factory_.Reset(); initialized_ = false;
+    }
+    void Text(const std::wstring& value, D2D1_RECT_F rect) {
+        D2D1_RECT_F shade = rect; shade.left += 1; shade.right += 1; shade.top += 1; shade.bottom += 1;
+        d2d_->DrawText(value.c_str(), static_cast<UINT32>(value.size()), textFormat_.Get(), shade,
+            shadow_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+        d2d_->DrawText(value.c_str(), static_cast<UINT32>(value.size()), textFormat_.Get(), rect,
+            white_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+    }
+    void DrawNoFrame(HWND hwnd) {
+        RECT rc{}; GetClientRect(hwnd, &rc);
+        const std::wstring message = g_videoStatus.empty() ? Tr(TextId::VideoSelect) : g_videoStatus;
+        d2d_->DrawText(message.c_str(), static_cast<UINT32>(message.size()), statusFormat_.Get(),
+            D2D1::RectF(20, 12, static_cast<float>(std::max<LONG>(20, rc.right - 20)),
+                static_cast<float>(std::max<LONG>(12, rc.bottom - 12))), white_.Get(),
+            D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+    }
+    void DrawToolbar(HWND hwnd) {
+        RECT rc{}; GetClientRect(hwnd, &rc);
+        const int width = rc.right;
+        const int videoComboW = std::max(180, width / 3);
         const int audioLabelX = 100 + videoComboW + 12;
         const int audioComboX = audioLabelX + 48;
-        const int audioComboW = std::max(150, clientAreaWidth - audioComboX - 315);
+        const int audioComboW = std::max(150, width - audioComboX - 315);
         const int resLabelX = audioComboX + audioComboW + 10;
-
-        drawLabel(Tr(TextId::CaptureDeviceLabel), RECT{ 12, 8, 96, 36 });
-        drawLabel(Tr(TextId::AudioLabel), RECT{ audioLabelX, 8, audioLabelX + 46, 36 });
-        drawLabel(Tr(TextId::ResolutionLabel), RECT{ resLabelX, 8, resLabelX + 74, 36 });
-        drawLabel(std::wstring(Tr(TextId::VolumeLabel)) + std::to_wstring(g_settings.volume) + L"%",
-            RECT{ 12, 48, 124, 80 });
-        if (!g_statusText.empty()) {
-            drawLabel(g_statusText, RECT{ 600, 48, std::max(720, clientAreaWidth - 12), 80 });
-        }
-        SetBkMode(buffer.dc, oldBkMode);
-        if (oldFont) SelectObject(buffer.dc, oldFont);
+        Text(Tr(TextId::CaptureDeviceLabel), D2D1::RectF(12, 8, 96, 36));
+        Text(Tr(TextId::AudioLabel), D2D1::RectF(static_cast<float>(audioLabelX), 8, static_cast<float>(audioLabelX + 46), 36));
+        Text(Tr(TextId::ResolutionLabel), D2D1::RectF(static_cast<float>(resLabelX), 8, static_cast<float>(resLabelX + 82), 36));
+        Text(std::wstring(Tr(TextId::VolumeLabel)) + std::to_wstring(g_settings.volume) + L"%", D2D1::RectF(12, 48, 124, 80));
+        if (!g_statusText.empty()) Text(g_statusText, D2D1::RectF(600, 48, static_cast<float>(std::max(720, width - 12)), 80));
     }
+    void DrawStats(HWND hwnd) {
+        RECT rc{}; GetClientRect(hwnd, &rc);
+        std::wstring value = g_uiLanguage == UiLanguage::English
+            ? L"CAP " + std::to_wstring(g_captureFps) + L" FPS  |  RENDER " + std::to_wstring(g_renderFps) + L" FPS  |  DROPPED " + std::to_wstring(g_droppedFps)
+            : L"CAPTURA " + std::to_wstring(g_captureFps) + L" FPS  |  RENDER " + std::to_wstring(g_renderFps) + L" FPS  |  PERDIDOS " + std::to_wstring(g_droppedFps);
+        Text(value, D2D1::RectF(12, 84, static_cast<float>(std::max<LONG>(240, rc.right - 12)), 110));
+    }
+    void DrawPipOverlay(HWND hwnd) {
+        RECT rc{}; GetClientRect(hwnd, &rc);
+        d2d_->FillRectangle(D2D1::RectF(0, 0, static_cast<float>(rc.right), static_cast<float>(rc.bottom)), dim_.Get());
+        const int minDimension = static_cast<int>(std::min(rc.right, rc.bottom));
+        const int buttonSize = std::clamp(minDimension / 5, 48, 64);
+        const int gap = std::max(12, buttonSize / 4);
+        const int totalWidth = buttonSize * 2 + gap;
+        const float left = static_cast<float>((rc.right - totalWidth) / 2);
+        const float top = static_cast<float>((rc.bottom - buttonSize) / 2);
+        const float cx[2] = { left + buttonSize * 0.5f, left + buttonSize + gap + buttonSize * 0.5f };
+        const float cy[2] = { top + buttonSize * 0.5f, top + buttonSize * 0.5f };
+        const float r = buttonSize * 0.5f;
+        const D2D1_ELLIPSE e1 = D2D1::Ellipse(D2D1::Point2F(cx[0], cy[0]), r, r);
+        const D2D1_ELLIPSE e2 = D2D1::Ellipse(D2D1::Point2F(cx[1], cy[1]), r, r);
+        d2d_->FillEllipse(e1, button_.Get()); d2d_->FillEllipse(e2, button_.Get());
+        d2d_->DrawEllipse(e1, cyan_.Get(), 2.5f); d2d_->DrawEllipse(e2, red_.Get(), 2.5f);
+        const float k = std::max(18.0f, r * 0.55f);
+        d2d_->DrawRectangle(D2D1::RectF(cx[0]-k*0.55f, cy[0]-k*0.45f, cx[0]+k*0.55f, cy[0]+k*0.45f), cyan_.Get(), 2.4f);
+        d2d_->DrawLine(D2D1::Point2F(cx[0]-k*0.05f,cy[0]+k*0.30f), D2D1::Point2F(cx[0]+k*0.45f,cy[0]-k*0.24f), cyan_.Get(), 2.6f);
+        d2d_->DrawLine(D2D1::Point2F(cx[0]+k*0.45f,cy[0]-k*0.24f), D2D1::Point2F(cx[0]+k*0.12f,cy[0]-k*0.24f), cyan_.Get(), 2.6f);
+        d2d_->DrawLine(D2D1::Point2F(cx[0]+k*0.45f,cy[0]-k*0.24f), D2D1::Point2F(cx[0]+k*0.45f,cy[0]+k*0.08f), cyan_.Get(), 2.6f);
+        d2d_->DrawLine(D2D1::Point2F(cx[1]-k*0.42f,cy[1]-k*0.42f), D2D1::Point2F(cx[1]+k*0.42f,cy[1]+k*0.42f), red_.Get(), 3.0f);
+        d2d_->DrawLine(D2D1::Point2F(cx[1]+k*0.42f,cy[1]-k*0.42f), D2D1::Point2F(cx[1]-k*0.42f,cy[1]+k*0.42f), red_.Get(), 3.0f);
+    }
+    bool initialized_ = false;
+    ComPtr<ID3D11Device> device_;
+    ComPtr<ID3D11DeviceContext> context_;
+    ComPtr<IDXGIFactory2> factory_;
+    ComPtr<ID3D11VertexShader> vs_;
+    ComPtr<ID3D11PixelShader> ps_;
+    ComPtr<ID3D11SamplerState> sampler_;
+    ComPtr<ID3D11RasterizerState> rasterizer_;
+    ComPtr<ID3D11Texture2D> frameTexture_;
+    ComPtr<ID3D11ShaderResourceView> frameView_;
+    int frameWidth_ = 0, frameHeight_ = 0;
+    bool frameHasMipmaps_ = false;
+    uint64_t lastUploadedSequence_ = 0;
+    uint64_t lastCountedSequence_ = 0;
+    ComPtr<ID2D1Factory1> d2dFactory_;
+    ComPtr<ID2D1Device> d2dDevice_;
+    ComPtr<ID2D1DeviceContext> d2d_;
+    ComPtr<IDWriteFactory> dwrite_;
+    ComPtr<IDWriteTextFormat> textFormat_, statusFormat_;
+    ComPtr<ID2D1SolidColorBrush> white_, shadow_, dim_, button_, cyan_, red_;
+    WindowTarget mainTarget_, pipTarget_;
+};
 
-    // PiP hover controls are drawn into the same back buffer so the user sees
-    // one atomic presentation rather than a video blit followed by an overlay blit.
-    if (compact && g_pipHover) DrawPipHoverActions(buffer.dc, window);
+VideoRenderer g_videoRenderer;
 
-    // Present the completed frame in one operation to prevent visible clears
-    // and partial GDI redraws in the main preview and the PiP window.
-    BitBlt(target, 0, 0, width, height, buffer.dc, 0, 0, SRCCOPY);
+void DestroyPaintBuffer(HWND hwnd) { g_videoRenderer.DestroyTarget(hwnd); }
+bool DrawPreview(HWND, HWND window, bool compact = false) { return g_videoRenderer.Render(window, compact); }
+
+void DrawRendererFallback(HDC dc, HWND hwnd) {
+    RECT rc{}; GetClientRect(hwnd, &rc);
+    HBRUSH background = CreateSolidBrush(RGB(7, 10, 16));
+    FillRect(dc, &rc, background);
+    DeleteObject(background);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(225, 232, 240));
+    DrawTextW(dc, Tr(TextId::RendererUnavailable), -1, &rc,
+        DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
 }
 
 void InvalidateVideoSurface(HWND target) {
@@ -2106,7 +2476,7 @@ LRESULT CALLBACK PipWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
-        DrawPreview(dc, hwnd, g_pipPaintBuffer, true);
+        if (!DrawPreview(hwnd, hwnd, true)) DrawRendererFallback(dc, hwnd);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -2219,7 +2589,7 @@ LRESULT CALLBACK PipWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
         g_pipHover = false;
         return 0;
     case WM_DESTROY:
-        DestroyPaintBuffer(g_pipPaintBuffer);
+        DestroyPaintBuffer(hwnd);
         if (g_pipHwnd == hwnd) g_pipHwnd = nullptr;
         return 0;
     }
@@ -2291,6 +2661,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         CreateAppMenu(hwnd);
         RefreshDevices(true);
         SetTimer(hwnd, TIMER_RECONNECT, 2500, nullptr);
+        SetTimer(hwnd, TIMER_STATS, 1000, nullptr);
         return 0;
     }
     case WM_SIZE:
@@ -2386,6 +2757,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case IDC_PIP: TogglePictureInPicture(); return 0;
         case IDM_VIEW_PIP: TogglePictureInPicture(); return 0;
         case IDM_PIP_TOPMOST: TogglePipTopmost(); return 0;
+        case IDM_SHOW_PERFORMANCE_STATS:
+            g_settings.showPerformanceStats = !g_settings.showPerformanceStats;
+            SaveSettings();
+            RequestMenuRebuild();
+            InvalidateVideoSurface(hwnd);
+            return 0;
         case IDM_SHOW_TOOLBAR:
             g_settings.showToolbar = !g_settings.showToolbar;
             UpdateOverlayVisibility(true);
@@ -2435,6 +2812,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         }
         if (wParam == VK_ESCAPE && g_windowMode == 2) { SetWindowMode(0); return 0; }
         break;
+    case WM_APP_CLEAR_FRAME:
+        g_videoRenderer.ClearFrame();
+        InvalidateVideoSurface(hwnd);
+        if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) InvalidateVideoSurface(g_pipHwnd);
+        return 0;
     case WM_APP_FRAME:
         g_frameMessagePending.store(false);
         InvalidateVideoSurface(hwnd);
@@ -2451,10 +2833,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         g_videoStatus = Tr(TextId::VideoSignalLostRetry);
         g_videoHasFrame.store(false);
         g_nextVideoRetry = GetTickCount64() + 2500;
-        {
-            std::lock_guard<std::mutex> lock(g_frameMutex);
-            g_latestFrame = {};
-        }
+        ClearQueuedFrames();
+        g_videoRenderer.ClearFrame();
         UpdateStatusText();
         InvalidateVideoSurface(hwnd);
         if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) InvalidateVideoSurface(g_pipHwnd);
@@ -2467,6 +2847,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_TIMER:
         if (wParam == TIMER_OVERLAY) {
             UpdateOverlayVisibility(false);
+            return 0;
+        }
+        if (wParam == TIMER_STATS) {
+            g_captureFps = static_cast<int>(g_captureFramesInterval.exchange(0, std::memory_order_relaxed));
+            g_renderFps = static_cast<int>(g_renderFramesInterval.exchange(0, std::memory_order_relaxed));
+            g_droppedFps = static_cast<int>(g_droppedFramesInterval.exchange(0, std::memory_order_relaxed));
+            if (g_settings.showPerformanceStats) {
+                InvalidateVideoSurface(hwnd);
+                if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) InvalidateVideoSurface(g_pipHwnd);
+            }
             return 0;
         }
         if (wParam == TIMER_RECONNECT) {
@@ -2514,7 +2904,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
-        DrawPreview(dc, hwnd, g_mainPaintBuffer, false);
+        if (!DrawPreview(hwnd, hwnd, false)) DrawRendererFallback(dc, hwnd);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -2546,6 +2936,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     }
     case WM_CLOSE:
         KillTimer(hwnd, TIMER_RECONNECT);
+        KillTimer(hwnd, TIMER_STATS);
         if (g_pipHwnd) DestroyWindow(g_pipHwnd);
         g_videoCapture.Stop();
         g_audioCapture.Stop();
@@ -2556,10 +2947,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         SaveSettings();
         KillTimer(hwnd, TIMER_OVERLAY);
         KillTimer(hwnd, TIMER_RECONNECT);
+        KillTimer(hwnd, TIMER_STATS);
         if (g_pipHwnd && IsWindow(g_pipHwnd)) DestroyWindow(g_pipHwnd);
         g_videoCapture.Stop();
         g_audioCapture.Stop();
-        DestroyPaintBuffer(g_mainPaintBuffer);
+        g_videoRenderer.Destroy();
         HideVolumeTooltip();
         if (g_volumeTooltip) { DestroyWindow(g_volumeTooltip); g_volumeTooltip = nullptr; }
         if (g_appMenu) { DestroyMenu(g_appMenu); g_appMenu = nullptr; }
