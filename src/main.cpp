@@ -26,6 +26,8 @@
 #include <string>
 #include <vector>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <deque>
 #include <algorithm>
@@ -61,6 +63,8 @@ constexpr UINT WM_APP_VIDEO_LOST = WM_APP + 3;
 constexpr UINT WM_APP_AUDIO_LOST = WM_APP + 4;
 constexpr UINT WM_APP_REBUILD_MENU = WM_APP + 5;
 constexpr UINT WM_APP_CLEAR_FRAME = WM_APP + 6;
+constexpr UINT WM_APP_VIDEO_MODES = WM_APP + 7;
+constexpr UINT WM_APP_OVERLAY_RECHECK = WM_APP + 8;
 constexpr UINT_PTR TIMER_RECONNECT = 1;
 constexpr UINT_PTR TIMER_OVERLAY = 2;
 constexpr UINT_PTR TIMER_STATS = 3;
@@ -238,6 +242,11 @@ struct VideoMode {
     UINT32 height = 0;
 };
 
+struct VideoModesUpdate {
+    std::wstring deviceId;
+    std::vector<VideoMode> modes;
+};
+
 struct Settings {
     std::wstring videoId;
     std::wstring videoName;
@@ -319,9 +328,11 @@ std::atomic_uint64_t g_frameSequence{ 0 };
 std::atomic_uint64_t g_captureFramesInterval{ 0 };
 std::atomic_uint64_t g_renderFramesInterval{ 0 };
 std::atomic_uint64_t g_droppedFramesInterval{ 0 };
+std::atomic_uint g_nominalVideoFps{ 60 };
 int g_captureFps = 0;
 int g_renderFps = 0;
 int g_droppedFps = 0;
+ULONGLONG g_statsLastTick = 0;
 std::atomic_bool g_frameMessagePending{ false };
 std::atomic_int g_volume{ 80 };
 std::atomic_bool g_muted{ false };
@@ -344,6 +355,7 @@ bool g_preserveRestoreRect = false;
 WINDOWPLACEMENT g_preFullscreenPlacement{};
 bool g_hasPreFullscreenPlacement = false;
 bool g_overlayVisible = true;
+bool g_suppressToolbarRevealUntilLeave = false;
 bool g_pipHover = false;
 std::filesystem::path g_appDirectory;
 std::filesystem::path g_settingsPath;
@@ -414,6 +426,24 @@ void ClearQueuedFrames() {
         slot.state.compare_exchange_strong(expected, static_cast<int>(FrameSlotState::Free),
             std::memory_order_acq_rel);
     }
+}
+
+int CalculateFramesPerSecond(uint64_t frameCount, ULONGLONG elapsedMs) {
+    if (elapsedMs == 0) return 0;
+    const uint64_t rate = (frameCount * 1000ULL + elapsedMs / 2ULL) / elapsedMs;
+    const uint64_t nominal = std::clamp<uint64_t>(g_nominalVideoFps.load(std::memory_order_relaxed), 1ULL, 240ULL);
+    // A capture stream cannot present more unique frames than its negotiated
+    // frame rate. This also prevents timer stalls or mode transitions from
+    // producing impossible spikes such as 300 or 9000 FPS.
+    return static_cast<int>(std::min<uint64_t>(rate, nominal));
+}
+
+void ResetPerformanceStats() {
+    g_captureFramesInterval.exchange(0, std::memory_order_relaxed);
+    g_renderFramesInterval.exchange(0, std::memory_order_relaxed);
+    g_droppedFramesInterval.exchange(0, std::memory_order_relaxed);
+    g_captureFps = g_renderFps = g_droppedFps = 0;
+    g_statsLastTick = GetTickCount64();
 }
 
 void LoadLanguagePreference() {
@@ -945,36 +975,6 @@ bool ContainsDevice(const std::vector<DeviceInfo>& devices, const std::wstring& 
     return std::any_of(devices.begin(), devices.end(), [&](const DeviceInfo& device) { return device.id == id; });
 }
 
-std::vector<VideoMode> EnumerateVideoModes(const std::wstring& deviceId) {
-    std::vector<VideoMode> modes;
-    ComPtr<IMFMediaSource> source;
-    if (FAILED(CreateMediaSource(deviceId, true, &source))) return modes;
-    ComPtr<IMFSourceReader> reader;
-    HRESULT hr = MFCreateSourceReaderFromMediaSource(source.Get(), nullptr, &reader);
-    if (FAILED(hr)) { source->Shutdown(); return modes; }
-
-    for (DWORD index = 0; index < 128; ++index) {
-        ComPtr<IMFMediaType> mediaType;
-        hr = reader->GetNativeMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), index, &mediaType);
-        if (hr == MF_E_NO_MORE_TYPES) break;
-        if (FAILED(hr)) continue;
-        UINT32 width = 0, height = 0;
-        if (SUCCEEDED(MFGetAttributeSize(mediaType.Get(), MF_MT_FRAME_SIZE, &width, &height)) && width && height) {
-            const bool exists = std::any_of(modes.begin(), modes.end(), [&](const VideoMode& m) { return m.width == width && m.height == height; });
-            if (!exists) modes.push_back({ width, height });
-        }
-    }
-    reader.Reset();
-    source->Shutdown();
-    std::sort(modes.begin(), modes.end(), [](const VideoMode& a, const VideoMode& b) {
-        const uint64_t areaA = static_cast<uint64_t>(a.width) * a.height;
-        const uint64_t areaB = static_cast<uint64_t>(b.width) * b.height;
-        if (areaA != areaB) return areaA > areaB;
-        return a.width > b.width;
-    });
-    return modes;
-}
-
 void UpdateStatusText() {
     g_statusText = g_videoStatus;
     if (!g_audioStatus.empty()) g_statusText += L"    |    " + g_audioStatus;
@@ -985,32 +985,102 @@ void UpdateStatusText() {
 
 class VideoCapture {
 public:
-    ~VideoCapture() { Stop(); }
+    VideoCapture() = default;
+    ~VideoCapture() { Shutdown(); }
 
-    bool IsRunning() const { return running_.load(); }
+    bool IsRunning() const { return requestedActive_.load(std::memory_order_acquire); }
 
+    // Start/Stop are intentionally non-blocking. A single controller thread
+    // owns the Media Foundation source reader and serializes device changes.
+    // The UI never joins a thread that may be blocked inside a capture driver.
     void Start(HWND notifyWindow, const std::wstring& deviceId, int width, int height) {
-        Stop();
-        if (deviceId.empty()) return;
-        stopRequested_.store(false);
-        running_.store(true);
-        worker_ = std::thread([this, notifyWindow, deviceId, width, height]() {
-            Run(notifyWindow, deviceId, width, height);
-        });
+        if (deviceId.empty()) { Stop(); return; }
+        {
+            std::lock_guard<std::mutex> lock(controlMutex_);
+            if (shutdownRequested_) return;
+            pendingRequest_ = { notifyWindow, deviceId, width, height };
+            hasPendingRequest_ = true;
+            requestedActive_.store(true, std::memory_order_release);
+            stopRequested_.store(true, std::memory_order_release);
+            if (!controller_.joinable()) {
+                try {
+                    controller_ = std::thread([this]() { ControlLoop(); });
+                } catch (...) {
+                    hasPendingRequest_ = false;
+                    requestedActive_.store(false, std::memory_order_release);
+                    Log(L"No se pudo crear el hilo de control de video.");
+                    return;
+                }
+            } else {
+                CancelSynchronousIo(controller_.native_handle());
+            }
+        }
+        controlCv_.notify_one();
     }
 
     void Stop() {
-        stopRequested_.store(true);
-        if (worker_.joinable()) {
-            // Best-effort cancellation for a driver that has stalled inside
-            // the synchronous Source Reader call.
-            CancelSynchronousIo(worker_.native_handle());
-            worker_.join();
+        {
+            std::lock_guard<std::mutex> lock(controlMutex_);
+            hasPendingRequest_ = false;
+            requestedActive_.store(false, std::memory_order_release);
+            stopRequested_.store(true, std::memory_order_release);
+            if (controller_.joinable()) CancelSynchronousIo(controller_.native_handle());
         }
-        running_.store(false);
+        controlCv_.notify_one();
     }
 
+    // Called once after the message loop exits and before MFShutdown().
+    // Unlike Stop(), this waits for the worker, but never blocks normal UI use.
+    void ShutdownAndWait() { Shutdown(); }
+
 private:
+    struct CaptureRequest {
+        HWND notifyWindow = nullptr;
+        std::wstring deviceId;
+        int width = 0;
+        int height = 0;
+    };
+
+    void Shutdown() {
+        {
+            std::lock_guard<std::mutex> lock(controlMutex_);
+            if (shutdownRequested_) return;
+            shutdownRequested_ = true;
+            hasPendingRequest_ = false;
+            requestedActive_.store(false, std::memory_order_release);
+            stopRequested_.store(true, std::memory_order_release);
+            if (controller_.joinable()) CancelSynchronousIo(controller_.native_handle());
+        }
+        controlCv_.notify_one();
+        if (controller_.joinable()) controller_.join();
+    }
+
+    void ControlLoop() {
+        for (;;) {
+            CaptureRequest request;
+            {
+                std::unique_lock<std::mutex> lock(controlMutex_);
+                controlCv_.wait(lock, [this]() { return shutdownRequested_ || hasPendingRequest_; });
+                if (shutdownRequested_) break;
+                request = std::move(pendingRequest_);
+                pendingRequest_ = {};
+                hasPendingRequest_ = false;
+                stopRequested_.store(false, std::memory_order_release);
+                running_.store(true, std::memory_order_release);
+            }
+
+            Run(request.notifyWindow, request.deviceId, request.width, request.height);
+            running_.store(false, std::memory_order_release);
+
+            {
+                std::lock_guard<std::mutex> lock(controlMutex_);
+                if (!hasPendingRequest_) requestedActive_.store(false, std::memory_order_release);
+            }
+        }
+        running_.store(false, std::memory_order_release);
+        requestedActive_.store(false, std::memory_order_release);
+    }
+
     void Run(HWND notifyWindow, const std::wstring& deviceId, int requestedWidth, int requestedHeight) {
         const HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         ComPtr<IMFMediaSource> source;
@@ -1018,14 +1088,24 @@ private:
         HRESULT hr = CreateMediaSource(deviceId, true, &source);
         if (SUCCEEDED(hr)) {
             ComPtr<IMFAttributes> readerAttributes;
-            hr = MFCreateAttributes(&readerAttributes, 3);
+            hr = MFCreateAttributes(&readerAttributes, 2);
             if (SUCCEEDED(hr)) hr = readerAttributes->SetUINT32(MF_LOW_LATENCY, TRUE);
-            if (SUCCEEDED(hr)) hr = readerAttributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+            // Keep the same Source Reader configuration that was proven with
+            // UVC capture devices in PlayView 1.1.1. Do not force hardware
+            // transforms: some capture-card drivers expose audio normally but
+            // fail or stall their video stream when that flag is enabled.
             // Keep the advanced Source Reader processor enabled for real-time
             // format conversion. It supports the conversion/deinterlace path
             // and can use a registered hardware video processor when available.
             if (SUCCEEDED(hr)) hr = readerAttributes->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE);
             if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromMediaSource(source.Get(), readerAttributes.Get(), &reader);
+        }
+
+        if (stopRequested_.load(std::memory_order_acquire)) {
+            reader.Reset();
+            if (source) source->Shutdown();
+            if (SUCCEEDED(comHr)) CoUninitialize();
+            return;
         }
 
         if (SUCCEEDED(hr)) {
@@ -1036,7 +1116,24 @@ private:
             if (SUCCEEDED(hr) && requestedWidth > 0 && requestedHeight > 0)
                 hr = MFSetAttributeSize(requestedType.Get(), MF_MT_FRAME_SIZE, requestedWidth, requestedHeight);
             if (SUCCEEDED(hr)) hr = requestedType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-            if (SUCCEEDED(hr)) hr = reader->SetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr, requestedType.Get());
+            if (SUCCEEDED(hr)) {
+                const HRESULT requestedHr = reader->SetCurrentMediaType(
+                    static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr, requestedType.Get());
+                if (FAILED(requestedHr) && requestedWidth > 0 && requestedHeight > 0) {
+                    Log(L"Requested capture size could not be negotiated; retrying automatic size. HRESULT=" +
+                        std::to_wstring(static_cast<unsigned long>(requestedHr)));
+                    ComPtr<IMFMediaType> fallbackType;
+                    HRESULT fallbackHr = MFCreateMediaType(&fallbackType);
+                    if (SUCCEEDED(fallbackHr)) fallbackHr = fallbackType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+                    if (SUCCEEDED(fallbackHr)) fallbackHr = fallbackType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+                    if (SUCCEEDED(fallbackHr)) fallbackHr = fallbackType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+                    if (SUCCEEDED(fallbackHr)) fallbackHr = reader->SetCurrentMediaType(
+                        static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr, fallbackType.Get());
+                    hr = fallbackHr;
+                } else {
+                    hr = requestedHr;
+                }
+            }
         }
 
         UINT32 frameWidth = 0, frameHeight = 0;
@@ -1048,14 +1145,21 @@ private:
             UINT32 strideValue = 0;
             if (SUCCEEDED(hr) && SUCCEEDED(currentType->GetUINT32(MF_MT_DEFAULT_STRIDE, &strideValue))) stride = static_cast<LONG>(strideValue);
             if (stride == 0) stride = static_cast<LONG>(frameWidth * 4);
+            UINT32 fpsNumerator = 0, fpsDenominator = 0;
+            if (SUCCEEDED(hr) && SUCCEEDED(MFGetAttributeRatio(currentType.Get(), MF_MT_FRAME_RATE,
+                    &fpsNumerator, &fpsDenominator)) && fpsNumerator > 0 && fpsDenominator > 0) {
+                const UINT fps = static_cast<UINT>((fpsNumerator + fpsDenominator / 2) / fpsDenominator);
+                g_nominalVideoFps.store(std::clamp<UINT>(fps, 1U, 240U), std::memory_order_relaxed);
+            }
         }
 
         if (FAILED(hr) || frameWidth == 0 || frameHeight == 0) {
-            Log(L"No se pudo iniciar la captura de video. HRESULT=" + std::to_wstring(static_cast<unsigned long>(hr)));
-            PostMessageW(notifyWindow, WM_APP_VIDEO_LOST, 0, 0);
+            if (!stopRequested_.load()) {
+                Log(L"No se pudo iniciar la captura de video. HRESULT=" + std::to_wstring(static_cast<unsigned long>(hr)));
+                PostMessageW(notifyWindow, WM_APP_VIDEO_LOST, 0, 0);
+            }
             reader.Reset();
             if (source) source->Shutdown();
-            running_.store(false);
             if (SUCCEEDED(comHr)) CoUninitialize();
             return;
         }
@@ -1065,6 +1169,8 @@ private:
         // remain available when ReadSample exits with an error.
         DWORD lastStreamIndex = 0;
         DWORD lastReadFlags = 0;
+        unsigned int framesBeforeModeQuery = 0;
+        bool modesPublished = false;
         while (!stopRequested_.load()) {
             DWORD streamIndex = 0, flags = 0;
             LONGLONG timestamp = 0;
@@ -1072,6 +1178,7 @@ private:
             hr = reader->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, &streamIndex, &flags, &timestamp, &sample);
             lastStreamIndex = streamIndex;
             lastReadFlags = flags;
+            if (stopRequested_.load(std::memory_order_acquire)) break;
             if (FAILED(hr) || (flags & MF_SOURCE_READERF_ERROR)) break;
             if (flags & MF_SOURCE_READERF_ENDOFSTREAM) break;
             if (flags & (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED | MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED)) {
@@ -1085,21 +1192,26 @@ private:
                     UINT32 changedStride = 0;
                     stride = SUCCEEDED(changedType->GetUINT32(MF_MT_DEFAULT_STRIDE, &changedStride))
                         ? static_cast<LONG>(changedStride) : static_cast<LONG>(frameWidth * 4);
+                    UINT32 fpsNumerator = 0, fpsDenominator = 0;
+                    if (SUCCEEDED(MFGetAttributeRatio(changedType.Get(), MF_MT_FRAME_RATE,
+                            &fpsNumerator, &fpsDenominator)) && fpsNumerator > 0 && fpsDenominator > 0) {
+                        const UINT fps = static_cast<UINT>((fpsNumerator + fpsDenominator / 2) / fpsDenominator);
+                        g_nominalVideoFps.store(std::clamp<UINT>(fps, 1U, 240U), std::memory_order_relaxed);
+                    }
                 }
             }
             if (!sample) { Sleep(1); continue; }
 
             ComPtr<IMFMediaBuffer> buffer;
-            // Most UVC capture samples contain a single buffer. Avoid
-            // ConvertToContiguousBuffer (which may allocate and copy) on that
-            // common path; use it only for multi-buffer samples.
-            DWORD bufferCount = 0;
-            hr = sample->GetBufferCount(&bufferCount);
-            if (SUCCEEDED(hr) && bufferCount == 1)
-                hr = sample->GetBufferByIndex(0, &buffer);
-            else if (SUCCEEDED(hr))
-                hr = sample->ConvertToContiguousBuffer(&buffer);
-            if (FAILED(hr)) continue;
+            // Use the contiguous sample buffer for compatibility with UVC
+            // capture drivers. The direct GetBufferByIndex path introduced in
+            // 1.2.0 caused some devices to stop yielding readable video frames.
+            hr = sample->ConvertToContiguousBuffer(&buffer);
+            if (FAILED(hr)) {
+                Log(L"ConvertToContiguousBuffer failed; HRESULT=" +
+                    std::to_wstring(static_cast<unsigned long>(hr)));
+                continue;
+            }
 
             FrameSlot* frameSlot = AcquireFrameSlotForWrite();
             if (!frameSlot) continue;
@@ -1153,6 +1265,11 @@ private:
                 }
             }
 
+            if (copiedFrame && stopRequested_.load(std::memory_order_acquire)) {
+                ReleaseFrameSlot(frameSlot);
+                break;
+            }
+
             if (copiedFrame) {
                 frameSlot->width = static_cast<int>(frameWidth);
                 frameSlot->height = static_cast<int>(frameHeight);
@@ -1166,6 +1283,36 @@ private:
                     PostMessageW(notifyWindow, WM_APP_VIDEO_READY, 0, 0);
                 }
                 if (!g_frameMessagePending.exchange(true)) PostMessageW(notifyWindow, WM_APP_FRAME, 0, 0);
+                if (!modesPublished && ++framesBeforeModeQuery >= 24 && !stopRequested_.load()) {
+                    modesPublished = true;
+                    auto update = std::make_unique<VideoModesUpdate>();
+                    update->deviceId = deviceId;
+                    for (DWORD index = 0; index < 32 && !stopRequested_.load(); ++index) {
+                        ComPtr<IMFMediaType> nativeType;
+                        const HRESULT modeHr = reader->GetNativeMediaType(
+                            static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), index, &nativeType);
+                        if (modeHr == MF_E_NO_MORE_TYPES) break;
+                        if (FAILED(modeHr)) continue;
+                        UINT32 modeWidth = 0, modeHeight = 0;
+                        if (SUCCEEDED(MFGetAttributeSize(nativeType.Get(), MF_MT_FRAME_SIZE, &modeWidth, &modeHeight)) &&
+                            modeWidth > 0 && modeHeight > 0) {
+                            const bool duplicate = std::any_of(update->modes.begin(), update->modes.end(),
+                                [&](const VideoMode& mode) { return mode.width == modeWidth && mode.height == modeHeight; });
+                            if (!duplicate) update->modes.push_back({ modeWidth, modeHeight });
+                        }
+                    }
+                    std::sort(update->modes.begin(), update->modes.end(), [](const VideoMode& a, const VideoMode& b) {
+                        const uint64_t areaA = static_cast<uint64_t>(a.width) * a.height;
+                        const uint64_t areaB = static_cast<uint64_t>(b.width) * b.height;
+                        if (areaA != areaB) return areaA > areaB;
+                        return a.width > b.width;
+                    });
+                    if (!update->modes.empty() && !stopRequested_.load()) {
+                        auto* rawUpdate = update.release();
+                        if (!PostMessageW(notifyWindow, WM_APP_VIDEO_MODES, 0, reinterpret_cast<LPARAM>(rawUpdate)))
+                            delete rawUpdate;
+                    }
+                }
             } else {
                 ReleaseFrameSlot(frameSlot);
             }
@@ -1182,12 +1329,17 @@ private:
             Log(reason.str());
             PostMessageW(notifyWindow, WM_APP_VIDEO_LOST, 0, 0);
         }
-        running_.store(false);
         if (SUCCEEDED(comHr)) CoUninitialize();
     }
 
-    std::thread worker_;
-    std::atomic_bool stopRequested_{ false };
+    std::thread controller_;
+    std::mutex controlMutex_;
+    std::condition_variable controlCv_;
+    CaptureRequest pendingRequest_{};
+    bool hasPendingRequest_ = false;
+    bool shutdownRequested_ = false;
+    std::atomic_bool stopRequested_{ true };
+    std::atomic_bool requestedActive_{ false };
     std::atomic_bool running_{ false };
 };
 
@@ -1230,6 +1382,13 @@ private:
             if (SUCCEEDED(hr)) hr = readerAttributes->SetUINT32(MF_LOW_LATENCY, TRUE);
             if (SUCCEEDED(hr)) hr = readerAttributes->SetString(MF_READWRITE_MMCSS_CLASS_AUDIO, L"Pro Audio");
             if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromMediaSource(source.Get(), readerAttributes.Get(), &reader);
+        }
+
+        if (stopRequested_.load(std::memory_order_acquire)) {
+            reader.Reset();
+            if (source) source->Shutdown();
+            if (SUCCEEDED(comHr)) CoUninitialize();
+            return;
         }
 
         if (SUCCEEDED(hr)) {
@@ -1530,15 +1689,11 @@ void RefreshDevices(bool initial) {
         g_audioStatus = Tr(TextId::AudioUnconfigured);
     }
 
-    // Enumerate capture modes before opening the selected camera. Some UVC
-    // devices allow only one active source instance at a time.
-    if (videoPresent && (initial || !g_videoCapture.IsRunning())) {
-        g_videoModes = EnumerateVideoModes(g_settings.videoId);
-        PopulateResolutionCombo();
-    } else if (!videoPresent) {
-        g_videoModes.clear();
-        PopulateResolutionCombo();
-    }
+    // Resolution modes are discovered by the selected device's own Source
+    // Reader on its capture worker. This avoids opening the camera twice and
+    // keeps device setup out of the UI thread.
+    g_videoModes.clear();
+    PopulateResolutionCombo();
 
     if (startVideoNow) {
         g_videoStartTick = GetTickCount64();
@@ -1553,6 +1708,9 @@ void StartSelectedVideo(bool showErrorIfMissing = true) {
     g_videoCapture.Stop();
     g_videoHasFrame.store(false);
     g_videoStartTick = GetTickCount64();
+    g_nominalVideoFps.store(60, std::memory_order_relaxed);
+    g_lastVideoFrameTick.store(0, std::memory_order_relaxed);
+    ResetPerformanceStats();
     g_frameMessagePending.store(false);
     ClearQueuedFrames();
     PostMessageW(g_hwnd, WM_APP_CLEAR_FRAME, 0, 0);
@@ -1595,7 +1753,7 @@ void HandleVideoSelection() {
     g_settings.videoName = device.name;
     g_settings.width = 0;
     g_settings.height = 0;
-    g_videoModes = EnumerateVideoModes(g_settings.videoId);
+    g_videoModes.clear();
     PopulateResolutionCombo();
     SaveSettings();
     StartSelectedVideo(false);
@@ -1713,7 +1871,9 @@ void SetWindowMode(int mode) {
     }
 
     g_isChangingWindowMode = false;
+    if (g_windowMode == 2) g_suppressToolbarRevealUntilLeave = false;
     UpdateOverlayVisibility(true);
+    ResetPerformanceStats();
     SaveSettings();
     InvalidateVideoSurface(g_hwnd);
 }
@@ -1990,6 +2150,7 @@ public:
         frameTexture_.Reset();
         frameWidth_ = frameHeight_ = 0;
         frameHasMipmaps_ = false;
+        frameMipmapsRequested_ = false;
         lastUploadedSequence_ = 0;
         lastCountedSequence_ = 0;
     }
@@ -2045,6 +2206,12 @@ private:
         ComPtr<IDXGIDevice> dxgi;
         hr = device_.As(&dxgi);
         if (FAILED(hr)) { SetFailure(L"QueryInterface IDXGIDevice", hr); return false; }
+        ComPtr<IDXGIDevice1> dxgiDevice1;
+        if (SUCCEEDED(device_.As(&dxgiDevice1))) {
+            // Limit frames queued ahead of presentation, keeping input-to-screen
+            // latency predictable on hybrid-GPU laptops.
+            dxgiDevice1->SetMaximumFrameLatency(1);
+        }
         ComPtr<IDXGIAdapter> adapter;
         hr = dxgi->GetAdapter(&adapter);
         if (FAILED(hr)) { SetFailure(L"IDXGIDevice::GetAdapter", hr); return false; }
@@ -2161,6 +2328,21 @@ private:
         }
         return true;
     }
+    bool ShouldUseMipmaps(int sourceWidth, int sourceHeight) const {
+        auto isDownscaled = [sourceWidth, sourceHeight](HWND window) {
+            if (!window || !IsWindowVisible(window)) return false;
+            RECT rc{};
+            if (!GetClientRect(window, &rc)) return false;
+            const int width = std::max<LONG>(1, rc.right - rc.left);
+            const int height = std::max<LONG>(1, rc.bottom - rc.top);
+            // Mipmaps improve substantial reductions. At native or near-native
+            // size, avoid their per-frame generation cost altogether.
+            return width < static_cast<int>(sourceWidth * 0.90) ||
+                height < static_cast<int>(sourceHeight * 0.90);
+        };
+        return isDownscaled(g_hwnd) || isDownscaled(g_pipHwnd);
+    }
+
     bool UploadLatestFrame() {
         FrameSlot* slot = AcquireLatestFrameForRead();
         if (!slot) return true;
@@ -2171,13 +2353,16 @@ private:
             return true;
         }
 
-        if (!frameTexture_ || frameWidth_ != w || frameHeight_ != h) {
+        const bool wantMipmaps = ShouldUseMipmaps(w, h);
+        if (!frameTexture_ || frameWidth_ != w || frameHeight_ != h ||
+            frameMipmapsRequested_ != wantMipmaps) {
             frameView_.Reset();
             frameTexture_.Reset();
             frameHasMipmaps_ = false;
+            frameMipmapsRequested_ = wantMipmaps;
 
             UINT formatSupport = 0;
-            const bool canGenerateMipmaps =
+            const bool canGenerateMipmaps = wantMipmaps &&
                 SUCCEEDED(device_->CheckFormatSupport(DXGI_FORMAT_B8G8R8A8_UNORM, &formatSupport)) &&
                 (formatSupport & D3D11_FORMAT_SUPPORT_MIP_AUTOGEN) != 0;
 
@@ -2195,7 +2380,6 @@ private:
                 desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
                 desc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
             }
-            bool createdMipmaps = canGenerateMipmaps;
 
             ComPtr<ID3D11Texture2D> newTexture;
             ComPtr<ID3D11ShaderResourceView> newView;
@@ -2203,15 +2387,14 @@ private:
             if (SUCCEEDED(hr))
                 hr = device_->CreateShaderResourceView(newTexture.Get(), nullptr, &newView);
 
-            // If mipmap creation is rejected despite the format query, retry
-            // with a single-level texture and retain linear filtering.
+            // Some drivers advertise autogen support but reject this particular
+            // resource configuration. Fall back to a single-level linear texture.
             if (FAILED(hr) && canGenerateMipmaps) {
                 newView.Reset();
                 newTexture.Reset();
                 desc.MipLevels = 1;
                 desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
                 desc.MiscFlags = 0;
-                createdMipmaps = false;
                 hr = device_->CreateTexture2D(&desc, nullptr, &newTexture);
                 if (SUCCEEDED(hr))
                     hr = device_->CreateShaderResourceView(newTexture.Get(), nullptr, &newView);
@@ -2220,8 +2403,6 @@ private:
             if (FAILED(hr)) {
                 SetFailure(L"CreateTexture2D/CreateShaderResourceView", hr);
                 Log(L"Could not create the video texture; HRESULT=" + std::to_wstring(static_cast<unsigned long>(hr)));
-                // Return the slot to READY instead of freeing it. DrawPreview()
-                // can then consume it with the GDI fallback renderer.
                 slot->state.store(static_cast<int>(FrameSlotState::Ready), std::memory_order_release);
                 return false;
             }
@@ -2229,7 +2410,7 @@ private:
             frameView_ = std::move(newView);
             frameWidth_ = w;
             frameHeight_ = h;
-            frameHasMipmaps_ = createdMipmaps;
+            frameHasMipmaps_ = canGenerateMipmaps && desc.MipLevels == 0;
         }
 
         context_->UpdateSubresource(frameTexture_.Get(), 0, nullptr, slot->pixels.data(),
@@ -2324,8 +2505,9 @@ private:
     ComPtr<ID3D11RasterizerState> rasterizer_;
     ComPtr<ID3D11Texture2D> frameTexture_;
     ComPtr<ID3D11ShaderResourceView> frameView_;
-    int frameWidth_ = 0, frameHeight_ = 0;
     bool frameHasMipmaps_ = false;
+    bool frameMipmapsRequested_ = false;
+    int frameWidth_ = 0, frameHeight_ = 0;
     uint64_t lastUploadedSequence_ = 0;
     uint64_t lastCountedSequence_ = 0;
     ComPtr<ID2D1Factory1> d2dFactory_;
@@ -2592,6 +2774,7 @@ void UpdateOverlayVisibility(bool force) {
     // of the saved windowed-mode preference.
     const bool useHoverReveal = (g_windowMode == 2) || !g_settings.showToolbar;
     if (!useHoverReveal) {
+        g_suppressToolbarRevealUntilLeave = false;
         KillTimer(g_hwnd, TIMER_OVERLAY);
         if (!g_overlayVisible || force) ShowToolbarControls(true);
         return;
@@ -2610,10 +2793,13 @@ void UpdateOverlayVisibility(bool force) {
         }
     }
 
+    // After disabling the fixed toolbar, do not immediately reveal it just
+    // because the pointer is still over the menu bar. Require one leave/re-enter.
+    if (!inTopZone) g_suppressToolbarRevealUntilLeave = false;
     // Keep the bar open while a combo's native popup list is active, including
     // the lower entries that extend beyond the toolbar's visible top area.
     const bool comboIsOpen = IsAnyToolbarComboDropped();
-    const bool shouldShow = inTopZone || comboIsOpen;
+    const bool shouldShow = (inTopZone && !g_suppressToolbarRevealUntilLeave) || comboIsOpen;
     if (force || shouldShow != g_overlayVisible) ShowToolbarControls(shouldShow);
 }
 
@@ -2915,6 +3101,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         CreateAppMenu(hwnd);
         RefreshDevices(true);
         SetTimer(hwnd, TIMER_RECONNECT, 2500, nullptr);
+        g_statsLastTick = GetTickCount64();
         SetTimer(hwnd, TIMER_STATS, 1000, nullptr);
         return 0;
     }
@@ -2938,6 +3125,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     }
     case WM_COMMAND: {
         const UINT commandId = LOWORD(wParam);
+        if ((commandId == IDC_VIDEO_DEVICE || commandId == IDC_AUDIO_DEVICE || commandId == IDC_RESOLUTION) &&
+            HIWORD(wParam) == CBN_CLOSEUP) {
+            PostMessageW(hwnd, WM_APP_OVERLAY_RECHECK, 0, 0);
+            return 0;
+        }
         if (commandId == IDM_PROFILE_SAVE) { SaveCurrentAsProfile(); return 0; }
         if (commandId == IDM_PROFILE_DEFAULT) {
             if (g_windowMode != 0) SetWindowMode(0);
@@ -3013,12 +3205,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case IDM_PIP_TOPMOST: TogglePipTopmost(); return 0;
         case IDM_SHOW_PERFORMANCE_STATS:
             g_settings.showPerformanceStats = !g_settings.showPerformanceStats;
+            ResetPerformanceStats();
             SaveSettings();
             RequestMenuRebuild();
             InvalidateVideoSurface(hwnd);
             return 0;
         case IDM_SHOW_TOOLBAR:
             g_settings.showToolbar = !g_settings.showToolbar;
+            if (g_windowMode == 0 && !g_settings.showToolbar) {
+                // Don't let the still-open menu cursor immediately reveal it again.
+                g_suppressToolbarRevealUntilLeave = true;
+                ShowToolbarControls(false);
+                SetTimer(hwnd, TIMER_OVERLAY, 70, nullptr);
+            } else {
+                g_suppressToolbarRevealUntilLeave = false;
+            }
             UpdateOverlayVisibility(true);
             SaveSettings();
             RequestMenuRebuild();
@@ -3080,14 +3281,29 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_APP_REBUILD_MENU:
         CreateAppMenu(hwnd);
         return 0;
+    case WM_EXITMENULOOP:
+        PostMessageW(hwnd, WM_APP_OVERLAY_RECHECK, 0, 0);
+        return 0;
+    case WM_APP_OVERLAY_RECHECK:
+        UpdateOverlayVisibility(false);
+        return 0;
+    case WM_APP_VIDEO_MODES: {
+        std::unique_ptr<VideoModesUpdate> update(reinterpret_cast<VideoModesUpdate*>(lParam));
+        if (update && update->deviceId == g_settings.videoId) {
+            g_videoModes = std::move(update->modes);
+            PopulateResolutionCombo();
+        }
+        return 0;
+    }
     case WM_APP_VIDEO_READY:
         g_videoStatus = Tr(TextId::VideoActive);
+        g_nextVideoRetry = 0;
         UpdateStatusText();
         return 0;
     case WM_APP_VIDEO_LOST:
         g_videoStatus = Tr(TextId::VideoSignalLostRetry);
         g_videoHasFrame.store(false);
-        g_nextVideoRetry = GetTickCount64() + 2500;
+        g_nextVideoRetry = GetTickCount64() + 4000;
         ClearQueuedFrames();
         g_videoRenderer.ClearFrame();
         ClearCompatibilityFrame();
@@ -3106,9 +3322,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             return 0;
         }
         if (wParam == TIMER_STATS) {
-            g_captureFps = static_cast<int>(g_captureFramesInterval.exchange(0, std::memory_order_relaxed));
-            g_renderFps = static_cast<int>(g_renderFramesInterval.exchange(0, std::memory_order_relaxed));
-            g_droppedFps = static_cast<int>(g_droppedFramesInterval.exchange(0, std::memory_order_relaxed));
+            const ULONGLONG now = GetTickCount64();
+            const ULONGLONG elapsed = (g_statsLastTick > 0 && now > g_statsLastTick)
+                ? (now - g_statsLastTick) : 1000ULL;
+            if (elapsed >= 250ULL) {
+                const uint64_t captured = g_captureFramesInterval.exchange(0, std::memory_order_relaxed);
+                const uint64_t rendered = g_renderFramesInterval.exchange(0, std::memory_order_relaxed);
+                const uint64_t dropped = g_droppedFramesInterval.exchange(0, std::memory_order_relaxed);
+                const ULONGLONG lastFrame = g_lastVideoFrameTick.load(std::memory_order_relaxed);
+                const bool streamStale = !g_videoHasFrame.load(std::memory_order_relaxed) ||
+                    lastFrame == 0 || now > lastFrame + 1200ULL;
+                if (streamStale) {
+                    g_captureFps = 0;
+                    g_renderFps = 0;
+                    g_droppedFps = 0;
+                } else {
+                    g_captureFps = CalculateFramesPerSecond(captured, elapsed);
+                    g_renderFps = std::min(CalculateFramesPerSecond(rendered, elapsed), g_captureFps);
+                    g_droppedFps = CalculateFramesPerSecond(dropped, elapsed);
+                }
+                g_statsLastTick = now;
+            }
             if (g_settings.showPerformanceStats) {
                 InvalidateVideoSurface(hwnd);
                 if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) InvalidateVideoSurface(g_pipHwnd);
@@ -3130,29 +3364,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 InvalidateVideoSurface(hwnd);
             }
             if (!g_settings.videoId.empty() && !g_videoCapture.IsRunning() && now >= g_nextVideoRetry) {
-                g_videoDevices = EnumerateDevices(true);
-                PopulateDeviceCombo(g_videoCombo, g_videoDevices, g_settings.videoId, g_settings.videoName, Tr(TextId::SelectCaptureDevice));
-                if (ContainsDevice(g_videoDevices, g_settings.videoId)) {
-                    g_videoStatus = Tr(TextId::VideoReconnecting);
-                    g_videoStartTick = now;
-                    g_videoHasFrame.store(false);
-                    g_videoCapture.Start(hwnd, g_settings.videoId, g_settings.width, g_settings.height);
-                } else {
-                    g_videoStatus = std::wstring(Tr(TextId::VideoMissingPrefix)) + (g_settings.videoName.empty() ? Tr(TextId::UnknownDevice) : g_settings.videoName);
-                    g_nextVideoRetry = now + 4000;
-                }
+                g_videoStatus = Tr(TextId::VideoReconnecting);
+                g_videoStartTick = now;
+                g_nominalVideoFps.store(60, std::memory_order_relaxed);
+                ResetPerformanceStats();
+                g_lastVideoFrameTick.store(0, std::memory_order_relaxed);
+                g_videoHasFrame.store(false);
+                g_nextVideoRetry = now + 4000;
+                g_videoCapture.Start(hwnd, g_settings.videoId, g_settings.width, g_settings.height);
                 UpdateStatusText();
             }
             if (!g_settings.audioId.empty() && !g_audioCapture.IsRunning() && now >= g_nextAudioRetry) {
-                g_audioDevices = EnumerateDevices(false);
-                PopulateDeviceCombo(g_audioCombo, g_audioDevices, g_settings.audioId, g_settings.audioName, Tr(TextId::SelectCaptureAudio));
-                if (ContainsDevice(g_audioDevices, g_settings.audioId)) {
-                    g_audioCapture.Start(hwnd, g_settings.audioId);
-                    g_audioStatus = Tr(TextId::AudioConnected);
-                } else {
-                    g_audioStatus = Tr(TextId::AudioMissing);
-                    g_nextAudioRetry = now + 4000;
-                }
+                // Keep using only the saved endpoint ID. A retry never selects a
+                // different microphone or capture card audio endpoint.
+                g_audioCapture.Start(hwnd, g_settings.audioId);
+                g_audioStatus = Tr(TextId::AudioConnected);
+                g_nextAudioRetry = now + 4000;
                 UpdateStatusText();
             }
         }
@@ -3342,6 +3569,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     if (accelerators) DestroyAcceleratorTable(accelerators);
 
     g_videoCapture.Stop();
+    g_videoCapture.ShutdownAndWait();
     g_audioCapture.Stop();
     MFShutdown();
     if (SUCCEEDED(comHr)) CoUninitialize();
