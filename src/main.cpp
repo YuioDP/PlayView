@@ -2189,17 +2189,24 @@ public:
             return false;
         }
 
-        // Never let a busy DWM/DXGI presentation queue block the UI thread.
-        // DXGI_PRESENT_DO_NOT_WAIT returns DXGI_ERROR_WAS_STILL_DRAWING when
-        // the compositor has not released a back buffer yet. We skip that
-        // frame and let the coalesced notification present the newest one.
-        const HRESULT presentHr = t.swapChain->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
+        // Frame notifications are already coalesced by the auto-reset event in
+        // the message pump, so there is no need to drop a frame merely because
+        // DWM has not released the next flip-model buffer yet. DO_NOT_WAIT was
+        // causing DXGI_ERROR_WAS_STILL_DRAWING in composed windowed mode and
+        // effectively discarded every other frame on some systems. Present
+        // with SyncInterval=0 and no DO_NOT_WAIT: DXGI queues the newest frame
+        // using the three-buffer swap chain, while the bounded event-driven
+        // pump continues to service input and window messages between frames.
+        const HRESULT presentHr = t.swapChain->Present(0, 0);
         if (presentHr == DXGI_ERROR_WAS_STILL_DRAWING) {
-            // Keep the uploaded frame available for a later paint/retry. Count
-            // it as dropped only if a newer frame supersedes it (see upload).
+            // Defensive fallback for drivers that still report a transient
+            // busy state. The next coalesced capture event retries the latest
+            // frame; do not count a repeated paint as a new video frame.
             return true;
         }
-        if (SUCCEEDED(presentHr) && lastUploadedSequence_ > lastCountedSequence_) {
+        // RENDER statistics describe the primary window only. PiP has its own
+        // swap chain and must not mask missed presentations in the main view.
+        if (!compact && SUCCEEDED(presentHr) && lastUploadedSequence_ > lastCountedSequence_) {
             g_renderFramesInterval.fetch_add(1, std::memory_order_relaxed);
             lastCountedSequence_ = lastUploadedSequence_;
         }
