@@ -67,7 +67,6 @@ constexpr UINT WM_APP_CLEAR_FRAME = WM_APP + 6;
 constexpr UINT WM_APP_VIDEO_MODES = WM_APP + 7;
 constexpr UINT WM_APP_OVERLAY_RECHECK = WM_APP + 8;
 constexpr UINT_PTR TIMER_RECONNECT = 1;
-constexpr UINT_PTR TIMER_OVERLAY = 2;
 constexpr UINT_PTR TIMER_STATS = 3;
 
 constexpr int IDC_VIDEO_DEVICE = 1001;
@@ -1618,11 +1617,38 @@ LRESULT CALLBACK VolumeSliderSubclass(HWND hwnd, UINT message, WPARAM wParam, LP
     return DefSubclassProc(hwnd, message, wParam, lParam);
 }
 
+LRESULT CALLBACK ToolbarHoverSubclass(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
+                                      UINT_PTR subclassId, DWORD_PTR referenceData) {
+    (void)wParam;
+    (void)lParam;
+    (void)referenceData;
+    switch (message) {
+    case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT tracking{ sizeof(tracking), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tracking);
+        // Child controls cover the parent window's client area. Re-evaluate
+        // the toolbar immediately while the pointer moves over those controls.
+        UpdateOverlayVisibility(false);
+        break;
+    }
+    case WM_MOUSELEAVE:
+    case WM_CANCELMODE:
+    case WM_CAPTURECHANGED:
+        UpdateOverlayVisibility(false);
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, ToolbarHoverSubclass, subclassId);
+        break;
+    }
+    return DefSubclassProc(hwnd, message, wParam, lParam);
+}
+
 HWND AddControl(DWORD exStyle, const wchar_t* className, const wchar_t* text, DWORD style,
                 int x, int y, int width, int height, int id) {
     HWND control = CreateWindowExW(exStyle, className, text, WS_CHILD | WS_VISIBLE | style,
         x, y, width, height, g_hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
     SetControlFont(control);
+    if (control) SetWindowSubclass(control, ToolbarHoverSubclass, static_cast<UINT_PTR>(id), 0);
     return control;
 }
 
@@ -2069,8 +2095,10 @@ class VideoRenderer {
         ComPtr<IDXGISwapChain3> swapChain;
         // Keep views for both flip-model back buffers. Recreating COM views on
         // every paint adds avoidable CPU overhead and can stall the UI thread.
-        std::array<ComPtr<ID3D11RenderTargetView>, 2> rtvs;
-        std::array<ComPtr<ID2D1Bitmap1>, 2> d2dTargets;
+        // Three flip-model back buffers reduce stalls while DWM is composing
+        // windowed presentation and keep a fresh frame available for each vblank.
+        std::array<ComPtr<ID3D11RenderTargetView>, 3> rtvs;
+        std::array<ComPtr<ID2D1Bitmap1>, 3> d2dTargets;
         UINT width = 0, height = 0;
     };
 public:
@@ -2224,12 +2252,10 @@ private:
         ComPtr<IDXGIDevice> dxgi;
         hr = device_.As(&dxgi);
         if (FAILED(hr)) { SetFailure(L"QueryInterface IDXGIDevice", hr); return false; }
-        ComPtr<IDXGIDevice1> dxgiDevice1;
-        if (SUCCEEDED(device_.As(&dxgiDevice1))) {
-            // Limit frames queued ahead of presentation, keeping input-to-screen
-            // latency predictable on hybrid-GPU laptops.
-            dxgiDevice1->SetMaximumFrameLatency(1);
-        }
+        // Keep DXGI's default frame-latency queue. Forcing a one-frame device
+        // queue without a waitable swap-chain object can stall a composed
+        // window while DWM is releasing its previous back buffer, which may
+        // halve the effective presentation cadence on some drivers.
         ComPtr<IDXGIAdapter> adapter;
         hr = dxgi->GetAdapter(&adapter);
         if (FAILED(hr)) { SetFailure(L"IDXGIDevice::GetAdapter", hr); return false; }
@@ -2293,7 +2319,7 @@ private:
             desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
             desc.SampleDesc.Count = 1;
             desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-            desc.BufferCount = static_cast<UINT>(t.rtvs.size());
+            desc.BufferCount = static_cast<UINT>(t.rtvs.size()); // 3 buffers for composed-window pacing
             desc.Scaling = DXGI_SCALING_STRETCH;
             desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
             desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
@@ -2795,12 +2821,12 @@ void UpdateOverlayVisibility(bool force) {
     const bool fixedWindowedToolbar = (g_windowMode == 0 && g_settings.showToolbar);
     if (fixedWindowedToolbar) {
         g_suppressToolbarRevealUntilLeave = false;
-        KillTimer(g_hwnd, TIMER_OVERLAY);
         if (!g_overlayVisible || force) ShowToolbarControls(true);
         return;
     }
 
-    SetTimer(g_hwnd, TIMER_OVERLAY, 50, nullptr);
+    // Visibility is driven directly by WM_MOUSEMOVE/WM_MOUSELEAVE from the
+    // parent and toolbar child controls. No polling timer is used.
     bool inTopZone = false;
     POINT cursor{};
     if (GetCursorPos(&cursor)) {
@@ -3201,6 +3227,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         SetTimer(hwnd, TIMER_STATS, 1000, nullptr);
         return 0;
     }
+    case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT tracking{ sizeof(tracking), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tracking);
+        UpdateOverlayVisibility(false);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        UpdateOverlayVisibility(false);
+        return 0;
     case WM_SIZE:
         if (!g_isChangingWindowMode && g_windowMode == 0) {
             if (wParam == SIZE_MAXIMIZED) g_windowMaximized = true;
@@ -3318,7 +3353,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                     // has left the menu/toolbar zone and entered it again.
                     g_suppressToolbarRevealUntilLeave = true;
                     ShowToolbarControls(false);
-                    SetTimer(hwnd, TIMER_OVERLAY, 50, nullptr);
                 }
             } else {
                 // Fullscreen behavior is independent of this saved setting.
@@ -3384,11 +3418,29 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         InvalidateVideoSurface(hwnd);
         if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) InvalidateVideoSurface(g_pipHwnd);
         return 0;
-    case WM_APP_FRAME:
-        g_frameMessagePending.store(false);
-        InvalidateVideoSurface(hwnd);
-        if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) InvalidateVideoSurface(g_pipHwnd);
+    case WM_APP_FRAME: {
+        g_frameMessagePending.store(false, std::memory_order_release);
+        // Render the newest capture frame directly from this UI-thread message.
+        // WM_PAINT is deliberately retained for exposure/resize and fallback,
+        // but it is not used as the video clock: Windows coalesces WM_PAINT and
+        // may dispatch it at a lower cadence in an overlapped window.
+        auto renderWindowNow = [](HWND target, bool compact) {
+            if (!target || !IsWindow(target) || !IsWindowVisible(target) || IsIconic(target)) return;
+            if (g_videoRenderer.Render(target, compact)) {
+                // Render() refreshed the entire DXGI surface. Clear any older
+                // invalid region so it cannot trigger a redundant paint later.
+                ValidateRect(target, nullptr);
+            } else {
+                // D3D11 unavailable: let the existing GDI compatibility path
+                // paint through WM_PAINT instead of blocking capture delivery.
+                InvalidateVideoSurface(target);
+                UpdateWindow(target);
+            }
+        };
+        renderWindowNow(hwnd, false);
+        if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) renderWindowNow(g_pipHwnd, true);
         return 0;
+    }
     case WM_APP_REBUILD_MENU:
         CreateAppMenu(hwnd);
         return 0;
@@ -3428,10 +3480,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         UpdateStatusText();
         return 0;
     case WM_TIMER:
-        if (wParam == TIMER_OVERLAY) {
-            UpdateOverlayVisibility(false);
-            return 0;
-        }
         if (wParam == TIMER_STATS) {
             const ULONGLONG now = GetTickCount64();
             const ULONGLONG elapsed = (g_statsLastTick > 0 && now > g_statsLastTick)
@@ -3540,7 +3588,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         return 0;
     case WM_DESTROY:
         SaveSettings();
-        KillTimer(hwnd, TIMER_OVERLAY);
         KillTimer(hwnd, TIMER_RECONNECT);
         KillTimer(hwnd, TIMER_STATS);
         if (g_aboutHwnd && IsWindow(g_aboutHwnd)) DestroyWindow(g_aboutHwnd);
