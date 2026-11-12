@@ -430,6 +430,31 @@ void ClearQueuedFrames() {
     }
 }
 
+bool HasQueuedReadyFrame() {
+    for (const auto& slot : g_frameSlots) {
+        if (slot.state.load(std::memory_order_acquire) == static_cast<int>(FrameSlotState::Ready))
+            return true;
+    }
+    return false;
+}
+
+// Coalesce capture notifications: at most one WM_APP_FRAME may be queued.
+// The UI handler keeps this flag set while it renders, then checks the slots
+// again and schedules one follow-up if newer frames arrived in the meantime.
+// This prevents a slow Present/D2D call from flooding the Win32 message queue
+// and starving input, menus, window management, and shutdown messages.
+void QueueVideoFrameMessage(HWND notifyWindow) {
+    if (!notifyWindow || !IsWindow(notifyWindow)) return;
+    bool expected = false;
+    if (!g_frameMessagePending.compare_exchange_strong(expected, true,
+            std::memory_order_acq_rel, std::memory_order_acquire)) return;
+    if (!PostMessageW(notifyWindow, WM_APP_FRAME, 0, 0)) {
+        // The target window may be closing or its thread queue may be full.
+        // Always release the token so a later frame can retry notification.
+        g_frameMessagePending.store(false, std::memory_order_release);
+    }
+}
+
 int CalculateFramesPerSecond(uint64_t frameCount, ULONGLONG elapsedMs) {
     if (elapsedMs == 0) return 0;
     const uint64_t rate = (frameCount * 1000ULL + elapsedMs / 2ULL) / elapsedMs;
@@ -1284,7 +1309,7 @@ private:
                     signaledReady = true;
                     PostMessageW(notifyWindow, WM_APP_VIDEO_READY, 0, 0);
                 }
-                if (!g_frameMessagePending.exchange(true)) PostMessageW(notifyWindow, WM_APP_FRAME, 0, 0);
+                QueueVideoFrameMessage(notifyWindow);
                 if (!modesPublished && ++framesBeforeModeQuery >= 24 && !stopRequested_.load()) {
                     modesPublished = true;
                     auto update = std::make_unique<VideoModesUpdate>();
@@ -1751,7 +1776,9 @@ void StartSelectedVideo(bool showErrorIfMissing = true) {
     g_nominalVideoFps.store(60, std::memory_order_relaxed);
     g_lastVideoFrameTick.store(0, std::memory_order_relaxed);
     ResetPerformanceStats();
-    g_frameMessagePending.store(false);
+    // Do not clear g_frameMessagePending here. If a frame notification is
+    // already queued, that handler will consume any frame from the new capture
+    // session too. Clearing it here could enqueue duplicate render messages.
     ClearQueuedFrames();
     PostMessageW(g_hwnd, WM_APP_CLEAR_FRAME, 0, 0);
     if (g_settings.videoId.empty()) {
@@ -2170,11 +2197,16 @@ public:
             return false;
         }
 
-        // Do not block the UI thread waiting for vertical blank in windowed mode.
-        // DWM composes flip-model windows at the display refresh rate; Present(0)
-        // lets each new capture frame enter that composition queue instead of
-        // throttling WM_PAINT to every second refresh on some desktop drivers.
-        const HRESULT presentHr = t.swapChain->Present(0, 0);
+        // Never let a busy DWM/DXGI presentation queue block the UI thread.
+        // DXGI_PRESENT_DO_NOT_WAIT returns DXGI_ERROR_WAS_STILL_DRAWING when
+        // the compositor has not released a back buffer yet. We skip that
+        // frame and let the coalesced notification present the newest one.
+        const HRESULT presentHr = t.swapChain->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
+        if (presentHr == DXGI_ERROR_WAS_STILL_DRAWING) {
+            // Keep the uploaded frame available for a later paint/retry. Count
+            // it as dropped only if a newer frame supersedes it (see upload).
+            return true;
+        }
         if (SUCCEEDED(presentHr) && lastUploadedSequence_ > lastCountedSequence_) {
             g_renderFramesInterval.fetch_add(1, std::memory_order_relaxed);
             lastCountedSequence_ = lastUploadedSequence_;
@@ -2392,6 +2424,13 @@ private:
         if (!slot) return true;
         const int w = slot->width;
         const int h = slot->height;
+        const uint64_t incomingSequence = slot->sequence.load(std::memory_order_relaxed);
+        // If a previous uploaded frame could not be presented because DXGI was
+        // busy, it becomes genuinely dropped only when a newer unique frame
+        // replaces it. This avoids inflating DROPPED when a repaint later
+        // succeeds with the same frame.
+        if (lastUploadedSequence_ > lastCountedSequence_ && incomingSequence > lastUploadedSequence_)
+            g_droppedFramesInterval.fetch_add(1, std::memory_order_relaxed);
         if (w <= 0 || h <= 0 || slot->pixels.empty()) {
             ReleaseFrameSlot(slot);
             return true;
@@ -2460,7 +2499,7 @@ private:
         context_->UpdateSubresource(frameTexture_.Get(), 0, nullptr, slot->pixels.data(),
             static_cast<UINT>(w * 4), 0);
         if (frameHasMipmaps_) context_->GenerateMips(frameView_.Get());
-        lastUploadedSequence_ = slot->sequence.load(std::memory_order_relaxed);
+        lastUploadedSequence_ = incomingSequence;
         ReleaseFrameSlot(slot);
         return true;
     }
@@ -3419,7 +3458,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) InvalidateVideoSurface(g_pipHwnd);
         return 0;
     case WM_APP_FRAME: {
-        g_frameMessagePending.store(false, std::memory_order_release);
+        // Keep g_frameMessagePending set throughout rendering. Capture can
+        // replace stale ready slots, but it cannot post another UI message
+        // until this one completes. This bounds the message queue to one frame.
         // Render the newest capture frame directly from this UI-thread message.
         // WM_PAINT is deliberately retained for exposure/resize and fallback,
         // but it is not used as the video clock: Windows coalesces WM_PAINT and
@@ -3439,6 +3480,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         };
         renderWindowNow(hwnd, false);
         if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) renderWindowNow(g_pipHwnd, true);
+
+        // Release the notification token only after both targets have consumed
+        // the newest frame. Recheck after releasing it to close the race where
+        // capture published a frame while the token was still held.
+        g_frameMessagePending.store(false, std::memory_order_release);
+        if (HasQueuedReadyFrame()) QueueVideoFrameMessage(hwnd);
         return 0;
     }
     case WM_APP_REBUILD_MENU:
