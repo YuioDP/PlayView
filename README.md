@@ -29,9 +29,9 @@
 - Reuses Direct3D render-target views and Direct2D back-buffer targets between paints, recreating them only when a window is resized.
 - Keeps capture and presentation decoupled through an atomic three-slot frame exchange. If the render worker falls behind, older queued frames are dropped rather than building up latency.
 - A dedicated render worker owns Direct3D 11, DXGI and Direct2D presentation. The UI thread remains responsible for menus, dialogs, controls and window management, so modal menus no longer pause the presentation loop.
-- The main window uses vertical synchronization in windowed mode as an experiment to address the reported half-refresh presentation cadence. Fullscreen and PiP retain unsynchronized presentation, which already performed normally in the user's tests.
+- Windowed presentation currently uses non-blocking DXGI `Present(0, 0)` so that a missed compositor refresh does not hold the dedicated render worker until a later refresh. This is an explicit throughput experiment; fullscreen and PiP also use unsynchronized presentation.
 - New frames and interface redraw requests wake the render worker through coalesced events instead of posting one high-priority window message per captured frame.
-- Optional performance statistics show captured FPS, unique frames successfully submitted for presentation by the main window, and dropped frames. The presentation counter measures successful presentation calls, not the exact scan-out rate reported by the monitor. Values are bounded by the capture format's reported frame rate and reset when the stream becomes stale. Enable them from **View → Show performance statistics**.
+- Optional performance statistics show capture FPS, unique frames submitted by the application, DXGI's reported display-present rate when available, discarded frames, render-work time, and the time spent inside `Present`. DXGI display statistics may be unavailable on some drivers or unreliable in multi-monitor/fullscreen-transition scenarios; `N/D` means Windows did not provide a usable value. Enable them from **View → Show performance statistics**.
 - Video device start/stop requests are handled by a persistent background controller so the interface does not wait for a capture driver to release its reader. Native resolution modes are queried after the first frames are already flowing.
 
 ### Picture in Picture (PiP)
@@ -163,10 +163,10 @@ PlayView does not use Electron and does not require VLC, FFmpeg, or another medi
 - Reutiliza las vistas de destino de Direct3D y los destinos de búfer de Direct2D entre repintados; solo los recrea cuando cambia el tamaño de una ventana.
 - Desacopla la captura y la presentación mediante un intercambio atómico de tres búferes. Si el renderizador se retrasa, descarta fotogramas antiguos en lugar de acumular latencia.
 - Un hilo de renderizado independiente gestiona Direct3D 11, DXGI y Direct2D. El hilo de interfaz continúa atendiendo menús, diálogos y controles, por lo que la apertura de menús ya no debe detener el ciclo de presentación.
-- La ventana principal utiliza sincronización vertical en modo ventana como experimento de cadencia. La pantalla completa y PiP conservan la presentación sin sincronización vertical.
+- La presentación en modo ventana utiliza actualmente `Present(0, 0)` sin espera vertical bloqueante. Es una prueba de rendimiento para evitar que un refresco perdido retenga el hilo de renderizado hasta el siguiente ciclo. La pantalla completa y PiP también utilizan presentación sin sincronización vertical.
 - Las solicitudes para iniciar o detener la captura se procesan mediante un controlador persistente en segundo plano; la interfaz no espera a que el controlador del dispositivo libere el lector de video.
 - Las resoluciones nativas se consultan después de que ya comenzaron a recibirse los primeros fotogramas, sin abrir una segunda instancia de la capturadora.
-- Incluye estadísticas opcionales de FPS de captura, fotogramas únicos cuya presentación se completó correctamente en la ventana principal y fotogramas descartados. El contador de presentación mide las llamadas de presentación completadas, no la frecuencia exacta con la que el monitor muestra cada imagen. Los valores se limitan a la frecuencia informada por el formato de captura y se reinician cuando la señal deja de actualizarse. Se activan desde **Ver → Mostrar estadísticas de rendimiento**.
+- Incluye estadísticas opcionales de FPS de captura, fotogramas enviados por la aplicación, frecuencia de presentación en pantalla informada por DXGI cuando está disponible, fotogramas descartados, tiempo de trabajo del renderizado y tiempo empleado dentro de `Present`. DXGI puede no ofrecer estadísticas utilizables en algunos controladores o escenarios con varios monitores; `N/D` indica que Windows no proporcionó un valor fiable. Se activan desde **Ver → Mostrar estadísticas de rendimiento**.
 
 ### Picture in Picture (PiP)
 
@@ -249,7 +249,7 @@ PlayView está desarrollado en C++20 y utiliza componentes nativos de Windows:
 - Direct2D y DirectWrite para las superposiciones y los textos de la interfaz acelerados por GPU.
 - Un intercambio atómico de fotogramas de tres búferes entre el hilo de captura y el hilo de renderizado. Cuando es necesario, se descartan fotogramas antiguos para presentar el más reciente disponible.
 - Las nuevas imágenes se notifican mediante un evento auto-reset agrupado, en lugar de publicar un mensaje por cada fotograma. El hilo de renderizado mantiene la presentación separada del bucle de mensajes de la interfaz.
-- La presentación de la ventana principal usa `Present(1, 0)` en modo ventana para sincronizarla con la frecuencia de actualización de la pantalla; la pantalla completa y PiP usan `Present(0, 0)`.
+- La presentación de la ventana principal usa actualmente `Present(0, 0)` en modo ventana; la pantalla completa y PiP también usan presentación sin sincronización vertical.
 - Un controlador persistente en segundo plano que serializa las solicitudes de inicio y parada para evitar que la interfaz espere a que el controlador de captura libere el lector de video.
 - Windows Imaging Component para procesar los iconos personalizados de los perfiles.
 

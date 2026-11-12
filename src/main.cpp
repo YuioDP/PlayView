@@ -110,7 +110,10 @@ struct RenderUiState {
     int volume = 80;
     int captureFps = 0;
     int renderFps = 0;
+    int displayFps = -1;
     int droppedFps = 0;
+    int renderWorkTenthsMs = 0;
+    int presentWaitTenthsMs = 0;
     UiLanguage language = UiLanguage::Spanish;
     std::wstring statusText;
     std::wstring videoStatus;
@@ -349,11 +352,19 @@ std::array<FrameSlot, kFrameSlotCount> g_frameSlots;
 std::atomic_uint64_t g_frameSequence{ 0 };
 std::atomic_uint64_t g_captureFramesInterval{ 0 };
 std::atomic_uint64_t g_renderFramesInterval{ 0 };
+std::atomic_uint64_t g_displayFramesInterval{ 0 };
 std::atomic_uint64_t g_droppedFramesInterval{ 0 };
+std::atomic_uint64_t g_renderWorkMicrosecondsInterval{ 0 };
+std::atomic_uint64_t g_presentMicrosecondsInterval{ 0 };
+std::atomic_uint64_t g_renderTimingSamplesInterval{ 0 };
 std::atomic_uint g_nominalVideoFps{ 60 };
 int g_captureFps = 0;
 int g_renderFps = 0;
+int g_displayFps = -1;
 int g_droppedFps = 0;
+int g_renderWorkTenthsMs = 0;
+int g_presentWaitTenthsMs = 0;
+std::atomic_bool g_displayStatsSupported{ false };
 ULONGLONG g_statsLastTick = 0;
 HANDLE g_frameReadyEvent = nullptr; // auto-reset event consumed by the dedicated render worker
 std::atomic_int g_volume{ 80 };
@@ -479,7 +490,10 @@ void PublishRendererUiState() {
     state.volume = g_settings.volume;
     state.captureFps = g_captureFps;
     state.renderFps = g_renderFps;
+    state.displayFps = g_displayFps;
     state.droppedFps = g_droppedFps;
+    state.renderWorkTenthsMs = g_renderWorkTenthsMs;
+    state.presentWaitTenthsMs = g_presentWaitTenthsMs;
     state.language = g_uiLanguage;
     state.statusText = g_statusText;
     state.videoStatus = g_videoStatus;
@@ -490,6 +504,15 @@ void PublishRendererUiState() {
 RenderUiState GetRendererUiState() {
     std::lock_guard<std::mutex> lock(g_renderUiStateMutex);
     return g_renderUiState;
+}
+
+uint64_t QpcElapsedMicroseconds(const LARGE_INTEGER& start, const LARGE_INTEGER& end) {
+    static const LONGLONG frequency = []() -> LONGLONG {
+        LARGE_INTEGER value{};
+        return QueryPerformanceFrequency(&value) && value.QuadPart > 0 ? value.QuadPart : 1;
+    }();
+    if (end.QuadPart <= start.QuadPart) return 0;
+    return static_cast<uint64_t>((end.QuadPart - start.QuadPart) * 1000000LL / frequency);
 }
 
 int CalculateFramesPerSecond(uint64_t frameCount, ULONGLONG elapsedMs) {
@@ -505,8 +528,14 @@ int CalculateFramesPerSecond(uint64_t frameCount, ULONGLONG elapsedMs) {
 void ResetPerformanceStats() {
     g_captureFramesInterval.exchange(0, std::memory_order_relaxed);
     g_renderFramesInterval.exchange(0, std::memory_order_relaxed);
+    g_displayFramesInterval.exchange(0, std::memory_order_relaxed);
     g_droppedFramesInterval.exchange(0, std::memory_order_relaxed);
+    g_renderWorkMicrosecondsInterval.exchange(0, std::memory_order_relaxed);
+    g_presentMicrosecondsInterval.exchange(0, std::memory_order_relaxed);
+    g_renderTimingSamplesInterval.exchange(0, std::memory_order_relaxed);
     g_captureFps = g_renderFps = g_droppedFps = 0;
+    g_displayFps = -1;
+    g_renderWorkTenthsMs = g_presentWaitTenthsMs = 0;
     g_statsLastTick = GetTickCount64();
 }
 
@@ -2218,7 +2247,11 @@ public:
         // Do not consume a CPU frame until both the D3D device and the target
         // window are ready. If either setup step fails, GDI can still present
         // the queued frame instead of showing a blank/error screen.
+        const uint64_t sequenceBeforeUpload = lastUploadedSequence_;
+        LARGE_INTEGER renderWorkStart{};
+        if (!compact) QueryPerformanceCounter(&renderWorkStart);
         if (!UploadLatestFrame()) { DisableAfterFailure(); return false; }
+        const bool hasNewMainFrame = !compact && lastUploadedSequence_ > sequenceBeforeUpload;
 
         const UINT bufferIndex = t.swapChain->GetCurrentBackBufferIndex();
         if (bufferIndex >= static_cast<UINT>(t.rtvs.size()) ||
@@ -2278,25 +2311,37 @@ public:
             return false;
         }
 
-        // The main window uses vertical synchronization while windowed. This
-        // is a deliberate pacing experiment for systems where unsynchronized
-        // flip-model presents appear at half the desktop refresh cadence.
-        // Fullscreen and PiP retain SyncInterval=0 because they already sustain
-        // the expected capture rate in the user's setup. The render worker is
-        // independent from the Win32 message loop, so waiting for a windowed
-        // vblank cannot block menu tracking or other UI interaction.
-        const UINT syncInterval = (!compact && state.windowMode == 0) ? 1u : 0u;
-        const HRESULT presentHr = t.swapChain->Present(syncInterval, 0);
+        LARGE_INTEGER renderWorkEnd{};
+        if (hasNewMainFrame) QueryPerformanceCounter(&renderWorkEnd);
+        LARGE_INTEGER presentStart{};
+        if (hasNewMainFrame) QueryPerformanceCounter(&presentStart);
+
+        // Keep Present non-blocking in windowed mode. The previous SyncInterval=1
+        // experiment did not lift the measured rate above roughly 35 FPS and can
+        // make a missed compositor deadline wait for a later refresh. With the
+        // dedicated render worker, the next capture event can safely schedule
+        // the newest frame without tying presentation to the UI message loop.
+        const HRESULT presentHr = t.swapChain->Present(0, 0);
+        LARGE_INTEGER presentEnd{};
+        if (hasNewMainFrame) QueryPerformanceCounter(&presentEnd);
         if (presentHr == DXGI_ERROR_WAS_STILL_DRAWING) {
-            // Defensive fallback for drivers that still report a transient
-            // busy state. The next coalesced capture event retries the latest
-            // frame; do not count a repeated paint as a new video frame.
             return true;
         }
-        // RENDER statistics describe the primary window only. PiP has its own
-        // swap chain and must not mask missed presentations in the main view.
+        // DXGI frame statistics count images reported as presented to the
+        // display, which is distinct from successful Present() calls. They are
+        // available for flip-model swap chains in windowed mode.
+        if (!compact && SUCCEEDED(presentHr)) UpdateDisplayFrameStatistics(t.swapChain.Get());
+
+        // Count only unique new frames successfully submitted by the main view.
         if (!compact && SUCCEEDED(presentHr) && lastUploadedSequence_ > lastCountedSequence_) {
             g_renderFramesInterval.fetch_add(1, std::memory_order_relaxed);
+            if (hasNewMainFrame) {
+                g_renderWorkMicrosecondsInterval.fetch_add(
+                    QpcElapsedMicroseconds(renderWorkStart, renderWorkEnd), std::memory_order_relaxed);
+                g_presentMicrosecondsInterval.fetch_add(
+                    QpcElapsedMicroseconds(presentStart, presentEnd), std::memory_order_relaxed);
+                g_renderTimingSamplesInterval.fetch_add(1, std::memory_order_relaxed);
+            }
             lastCountedSequence_ = lastUploadedSequence_;
         }
         if (FAILED(presentHr)) {
@@ -2321,7 +2366,10 @@ public:
         lastCountedSequence_ = 0;
     }
     void DestroyTarget(HWND hwnd) {
-        if (mainTarget_.hwnd == hwnd) ResetTarget(mainTarget_);
+        if (mainTarget_.hwnd == hwnd) {
+            ResetTarget(mainTarget_);
+            haveLastDisplayPresentCount_ = false;
+        }
         if (pipTarget_.hwnd == hwnd) ResetTarget(pipTarget_);
     }
     void DestroyPipTarget() {
@@ -2329,6 +2377,7 @@ public:
     }
     void Destroy() {
         ResetTarget(mainTarget_); ResetTarget(pipTarget_); ClearFrame();
+        haveLastDisplayPresentCount_ = false;
         d2d_.Reset(); d2dDevice_.Reset(); d2dFactory_.Reset(); dwrite_.Reset();
         white_.Reset(); shadow_.Reset(); dim_.Reset(); button_.Reset(); cyan_.Reset(); red_.Reset();
         textFormat_.Reset(); statusFormat_.Reset(); sampler_.Reset(); ps_.Reset(); vs_.Reset();
@@ -2336,6 +2385,27 @@ public:
         disabled_ = false; failureLogged_ = false; failureStage_.clear(); failureHr_ = S_OK;
     }
 private:
+    void UpdateDisplayFrameStatistics(IDXGISwapChain3* swapChain) {
+        if (!swapChain) return;
+        DXGI_FRAME_STATISTICS statistics{};
+        const HRESULT hr = swapChain->GetFrameStatistics(&statistics);
+        if (SUCCEEDED(hr)) {
+            g_displayStatsSupported.store(true, std::memory_order_relaxed);
+            if (haveLastDisplayPresentCount_) {
+                const UINT delta = statistics.PresentCount - lastDisplayPresentCount_;
+                if (delta > 0) g_displayFramesInterval.fetch_add(delta, std::memory_order_relaxed);
+            }
+            lastDisplayPresentCount_ = statistics.PresentCount;
+            haveLastDisplayPresentCount_ = true;
+        } else if (hr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT) {
+            haveLastDisplayPresentCount_ = false;
+        } else if (!displayStatsFailureLogged_) {
+            displayStatsFailureLogged_ = true;
+            Log(L"DXGI GetFrameStatistics unavailable; HRESULT=" +
+                std::to_wstring(static_cast<unsigned long>(hr)));
+        }
+    }
+
     void SetFailure(const wchar_t* stage, HRESULT hr) {
         failureStage_ = stage ? stage : L"unknown renderer stage";
         failureHr_ = hr;
@@ -2604,6 +2674,7 @@ private:
     }
     void ResetDevice() {
         ResetTarget(mainTarget_); ResetTarget(pipTarget_); ClearFrame();
+        haveLastDisplayPresentCount_ = false;
         d2d_.Reset(); d2dDevice_.Reset(); d2dFactory_.Reset(); dwrite_.Reset();
         white_.Reset(); shadow_.Reset(); dim_.Reset(); button_.Reset(); cyan_.Reset(); red_.Reset();
         textFormat_.Reset(); statusFormat_.Reset(); sampler_.Reset(); ps_.Reset(); vs_.Reset();
@@ -2641,10 +2712,16 @@ private:
     }
     void DrawStats(HWND hwnd, const RenderUiState& state) {
         RECT rc{}; GetClientRect(hwnd, &rc);
-        std::wstring value = state.language == UiLanguage::English
-            ? L"CAP " + std::to_wstring(state.captureFps) + L" FPS  |  PRESENT " + std::to_wstring(state.renderFps) + L" FPS  |  DROPPED " + std::to_wstring(state.droppedFps)
-            : L"CAPTURA " + std::to_wstring(state.captureFps) + L" FPS  |  PRESENTACIÓN " + std::to_wstring(state.renderFps) + L" FPS  |  PERDIDOS " + std::to_wstring(state.droppedFps);
-        Text(value, D2D1::RectF(12, 84, static_cast<float>(std::max<LONG>(240, rc.right - 12)), 110));
+        const std::wstring display = state.displayFps >= 0 ? std::to_wstring(state.displayFps) : L"N/D";
+        const std::wstring firstLine = state.language == UiLanguage::English
+            ? L"CAP " + std::to_wstring(state.captureFps) + L" | APP " + std::to_wstring(state.renderFps) + L" | DISPLAY " + display + L" | DROPPED " + std::to_wstring(state.droppedFps)
+            : L"CAP " + std::to_wstring(state.captureFps) + L" | APP " + std::to_wstring(state.renderFps) + L" | MONITOR " + display + L" | DESCART. " + std::to_wstring(state.droppedFps);
+        const std::wstring secondLine = state.language == UiLanguage::English
+            ? L"RENDER " + std::to_wstring(state.renderWorkTenthsMs / 10) + L"." + std::to_wstring(state.renderWorkTenthsMs % 10) + L" ms  |  PRESENT " + std::to_wstring(state.presentWaitTenthsMs / 10) + L"." + std::to_wstring(state.presentWaitTenthsMs % 10) + L" ms"
+            : L"RENDER " + std::to_wstring(state.renderWorkTenthsMs / 10) + L"." + std::to_wstring(state.renderWorkTenthsMs % 10) + L" ms  |  PRESENT " + std::to_wstring(state.presentWaitTenthsMs / 10) + L"." + std::to_wstring(state.presentWaitTenthsMs % 10) + L" ms";
+        const float right = static_cast<float>(std::max<LONG>(240, rc.right - 12));
+        Text(firstLine, D2D1::RectF(12, 82, right, 104));
+        Text(secondLine, D2D1::RectF(12, 104, right, 126));
     }
     void DrawPipOverlay(HWND hwnd) {
         RECT rc{}; GetClientRect(hwnd, &rc);
@@ -2692,6 +2769,9 @@ private:
     ComPtr<IDWriteTextFormat> textFormat_, statusFormat_;
     ComPtr<ID2D1SolidColorBrush> white_, shadow_, dim_, button_, cyan_, red_;
     WindowTarget mainTarget_, pipTarget_;
+    UINT lastDisplayPresentCount_ = 0;
+    bool haveLastDisplayPresentCount_ = false;
+    bool displayStatsFailureLogged_ = false;
     bool disabled_ = false;
     bool failureLogged_ = false;
     std::wstring failureStage_ = L"initialization";
@@ -2853,10 +2933,15 @@ bool DrawCompatibilityPreview(HDC target, HWND window, bool compact) {
     }
 
     if (!compact && g_settings.showPerformanceStats) {
+        const std::wstring display = g_displayFps >= 0 ? std::to_wstring(g_displayFps) : L"N/D";
         const std::wstring stats = g_uiLanguage == UiLanguage::English
-            ? L"CAP " + std::to_wstring(g_captureFps) + L" FPS  |  PRESENT " + std::to_wstring(g_renderFps) + L" FPS  |  DROPPED " + std::to_wstring(g_droppedFps)
-            : L"CAPTURA " + std::to_wstring(g_captureFps) + L" FPS  |  PRESENTACIÓN " + std::to_wstring(g_renderFps) + L" FPS  |  PERDIDOS " + std::to_wstring(g_droppedFps);
-        DrawCompatibilityLabel(buffer.dc, g_uiFont, stats, RECT{ 12, 84, std::max(240, width - 12), 110 });
+            ? L"CAP " + std::to_wstring(g_captureFps) + L" | APP " + std::to_wstring(g_renderFps) + L" | DISPLAY " + display + L" | DROPPED " + std::to_wstring(g_droppedFps)
+            : L"CAP " + std::to_wstring(g_captureFps) + L" | APP " + std::to_wstring(g_renderFps) + L" | MONITOR " + display + L" | DESCART. " + std::to_wstring(g_droppedFps);
+        const std::wstring timing = g_uiLanguage == UiLanguage::English
+            ? L"RENDER " + std::to_wstring(g_renderWorkTenthsMs / 10) + L"." + std::to_wstring(g_renderWorkTenthsMs % 10) + L" ms | PRESENT " + std::to_wstring(g_presentWaitTenthsMs / 10) + L"." + std::to_wstring(g_presentWaitTenthsMs % 10) + L" ms"
+            : L"RENDER " + std::to_wstring(g_renderWorkTenthsMs / 10) + L"." + std::to_wstring(g_renderWorkTenthsMs % 10) + L" ms | PRESENT " + std::to_wstring(g_presentWaitTenthsMs / 10) + L"." + std::to_wstring(g_presentWaitTenthsMs % 10) + L" ms";
+        DrawCompatibilityLabel(buffer.dc, g_uiFont, stats, RECT{ 12, 82, std::max(240, width - 12), 104 });
+        DrawCompatibilityLabel(buffer.dc, g_uiFont, timing, RECT{ 12, 104, std::max(240, width - 12), 126 });
     }
     if (compact && g_pipHover) DrawPipHoverActions(buffer.dc, window);
 
@@ -3704,18 +3789,34 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             if (elapsed >= 250ULL) {
                 const uint64_t captured = g_captureFramesInterval.exchange(0, std::memory_order_relaxed);
                 const uint64_t rendered = g_renderFramesInterval.exchange(0, std::memory_order_relaxed);
+                const uint64_t displayed = g_displayFramesInterval.exchange(0, std::memory_order_relaxed);
                 const uint64_t dropped = g_droppedFramesInterval.exchange(0, std::memory_order_relaxed);
+                const uint64_t renderWorkUs = g_renderWorkMicrosecondsInterval.exchange(0, std::memory_order_relaxed);
+                const uint64_t presentUs = g_presentMicrosecondsInterval.exchange(0, std::memory_order_relaxed);
+                const uint64_t timingSamples = g_renderTimingSamplesInterval.exchange(0, std::memory_order_relaxed);
                 const ULONGLONG lastFrame = g_lastVideoFrameTick.load(std::memory_order_relaxed);
                 const bool streamStale = !g_videoHasFrame.load(std::memory_order_relaxed) ||
                     lastFrame == 0 || now > lastFrame + 1200ULL;
                 if (streamStale) {
                     g_captureFps = 0;
                     g_renderFps = 0;
+                    g_displayFps = g_displayStatsSupported.load(std::memory_order_relaxed) ? 0 : -1;
                     g_droppedFps = 0;
+                    g_renderWorkTenthsMs = 0;
+                    g_presentWaitTenthsMs = 0;
                 } else {
                     g_captureFps = CalculateFramesPerSecond(captured, elapsed);
                     g_renderFps = std::min(CalculateFramesPerSecond(rendered, elapsed), g_captureFps);
+                    g_displayFps = g_displayStatsSupported.load(std::memory_order_relaxed)
+                        ? CalculateFramesPerSecond(displayed, elapsed) : -1;
                     g_droppedFps = CalculateFramesPerSecond(dropped, elapsed);
+                    if (timingSamples > 0) {
+                        g_renderWorkTenthsMs = static_cast<int>((renderWorkUs + timingSamples * 50ULL) / (timingSamples * 100ULL));
+                        g_presentWaitTenthsMs = static_cast<int>((presentUs + timingSamples * 50ULL) / (timingSamples * 100ULL));
+                    } else {
+                        g_renderWorkTenthsMs = 0;
+                        g_presentWaitTenthsMs = 0;
+                    }
                 }
                 g_statsLastTick = now;
             }
