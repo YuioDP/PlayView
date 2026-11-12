@@ -31,9 +31,6 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item build/Release/PlayView.exe dist/PlayView.exe
-          Copy-Item README.md dist/README.txt
-          Copy-Item assets/logo.png dist/PlayView-logo.png
-          Copy-Item assets/icon.png dist/PlayView-icon.png
           Compress-Archive -Path dist/* -DestinationPath PlayView-Windows-x64.zip -Force
 
       - name: Upload build artifact
