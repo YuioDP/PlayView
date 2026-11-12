@@ -206,7 +206,7 @@ const wchar_t* Tr(TextId id) {
     case TextId::HidePip: return en ? L"Hide Picture in Picture" : L"Ocultar imagen en imagen";
     case TextId::AlwaysOnTop: return en ? L"Always on top" : L"Siempre visible";
     case TextId::PipCreateFailed: return en ? L"Could not create the Picture in Picture window." : L"No se pudo crear la ventana de imagen en imagen.";
-    case TextId::AboutBody: return en ? L"PlayView 1.2.1\nA lightweight monitor for video capture devices.\n\nCapture powered by Windows Media Foundation and Direct3D 11." : L"PlayView 1.2.1\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation y Direct3D 11.";
+    case TextId::AboutBody: return en ? L"PlayView 1.2.0\nA lightweight monitor for video capture devices.\n\nCapture powered by Windows Media Foundation and Direct3D 11." : L"PlayView 1.2.0\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation y Direct3D 11.";
     case TextId::RendererUnavailable: return en ? L"The Direct3D 11 renderer could not be initialized. Check playview.log for details." : L"No se pudo iniciar el renderizador Direct3D 11. Consulta playview.log para más detalles.";
     case TextId::AboutTitle: return en ? L"About PlayView" : L"Acerca de PlayView";
     case TextId::MediaFoundationStartupError: return en ? L"Could not initialize Windows Media Foundation. Make sure Windows is up to date." : L"No se pudo iniciar Windows Media Foundation. Comprueba que Windows esté actualizado.";
@@ -1061,11 +1061,17 @@ private:
         }
 
         bool signaledReady = false;
+        // Keep the last Source Reader diagnostics outside the loop so they
+        // remain available when ReadSample exits with an error.
+        DWORD lastStreamIndex = 0;
+        DWORD lastReadFlags = 0;
         while (!stopRequested_.load()) {
             DWORD streamIndex = 0, flags = 0;
             LONGLONG timestamp = 0;
             ComPtr<IMFSample> sample;
             hr = reader->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, &streamIndex, &flags, &timestamp, &sample);
+            lastStreamIndex = streamIndex;
+            lastReadFlags = flags;
             if (FAILED(hr) || (flags & MF_SOURCE_READERF_ERROR)) break;
             if (flags & MF_SOURCE_READERF_ENDOFSTREAM) break;
             if (flags & (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED | MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED)) {
@@ -1171,8 +1177,8 @@ private:
             std::wostringstream reason;
             reason << L"La captura de video se interrumpio o perdio el dispositivo."
                 << L" HRESULT=0x" << std::hex << std::uppercase << static_cast<unsigned long>(hr)
-                << L" flags=0x" << static_cast<unsigned long>(flags)
-                << L" stream=" << std::dec << streamIndex;
+                << L" flags=0x" << static_cast<unsigned long>(lastReadFlags)
+                << L" stream=" << std::dec << lastStreamIndex;
             Log(reason.str());
             PostMessageW(notifyWindow, WM_APP_VIDEO_LOST, 0, 0);
         }

@@ -1,4 +1,4 @@
-# PlayView 1.2.1 (English)
+# PlayView 1.2.0 (English)
 
 **PlayView** is a lightweight Windows capture-card monitor. It is designed to let you connect a game console, select the capture input, and play from a simple window without the extra features found in general-purpose media players.
 
@@ -122,11 +122,11 @@ PlayView does not use Electron and does not require VLC, FFmpeg, or another medi
 
 ---
 
-**PlayView 1.2.1** · A lightweight capture-card monitor for Windows.
+**PlayView 1.2.0** · A lightweight capture-card monitor for Windows.
 
 ---
 
-# PlayView 1.2.1 (Español)
+# PlayView 1.2.0 (Español)
 
 **PlayView** es un monitor ligero de capturadoras para Windows. Está diseñado para conectar una consola, seleccionar la entrada de captura y jugar desde una ventana sencilla, sin las funciones adicionales de los reproductores multimedia de propósito general.
 
@@ -250,4 +250,4 @@ PlayView no utiliza Electron ni requiere tener instalado VLC, FFmpeg u otro repr
 
 ---
 
-**PlayView 1.2.1** · Un monitor ligero de capturadoras para Windows.
+**PlayView 1.2.0** · Un monitor ligero de capturadoras para Windows.
