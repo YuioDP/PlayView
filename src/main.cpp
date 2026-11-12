@@ -112,8 +112,9 @@ struct RenderUiState {
     int renderFps = 0;
     int displayFps = -1;
     int droppedFps = 0;
-    int renderWorkTenthsMs = 0;
-    int presentWaitTenthsMs = 0;
+    int renderWorkMicroseconds = 0;
+    int presentMicroseconds = 0;
+    int rendererBackend = 0; // 0=initializing, 1=D3D11, 2=GDI compatibility
     UiLanguage language = UiLanguage::Spanish;
     std::wstring statusText;
     std::wstring videoStatus;
@@ -362,8 +363,9 @@ int g_captureFps = 0;
 int g_renderFps = 0;
 int g_displayFps = -1;
 int g_droppedFps = 0;
-int g_renderWorkTenthsMs = 0;
-int g_presentWaitTenthsMs = 0;
+int g_renderWorkMicrosecondsAverage = 0;
+int g_presentMicrosecondsAverage = 0;
+std::atomic_int g_rendererBackend{ 0 }; // 0=initializing, 1=D3D11, 2=GDI compatibility
 std::atomic_bool g_displayStatsSupported{ false };
 ULONGLONG g_statsLastTick = 0;
 HANDLE g_frameReadyEvent = nullptr; // auto-reset event consumed by the dedicated render worker
@@ -492,8 +494,9 @@ void PublishRendererUiState() {
     state.renderFps = g_renderFps;
     state.displayFps = g_displayFps;
     state.droppedFps = g_droppedFps;
-    state.renderWorkTenthsMs = g_renderWorkTenthsMs;
-    state.presentWaitTenthsMs = g_presentWaitTenthsMs;
+    state.renderWorkMicroseconds = g_renderWorkMicrosecondsAverage;
+    state.presentMicroseconds = g_presentMicrosecondsAverage;
+    state.rendererBackend = g_rendererBackend.load(std::memory_order_relaxed);
     state.language = g_uiLanguage;
     state.statusText = g_statusText;
     state.videoStatus = g_videoStatus;
@@ -535,7 +538,8 @@ void ResetPerformanceStats() {
     g_renderTimingSamplesInterval.exchange(0, std::memory_order_relaxed);
     g_captureFps = g_renderFps = g_droppedFps = 0;
     g_displayFps = -1;
-    g_renderWorkTenthsMs = g_presentWaitTenthsMs = 0;
+    g_renderWorkMicrosecondsAverage = g_presentMicrosecondsAverage = 0;
+    g_rendererBackend.store(0, std::memory_order_relaxed);
     g_statsLastTick = GetTickCount64();
 }
 
@@ -2327,10 +2331,10 @@ public:
         if (presentHr == DXGI_ERROR_WAS_STILL_DRAWING) {
             return true;
         }
-        // DXGI frame statistics count images reported as presented to the
-        // display, which is distinct from successful Present() calls. They are
-        // available for flip-model swap chains in windowed mode.
-        if (!compact && SUCCEEDED(presentHr)) UpdateDisplayFrameStatistics(t.swapChain.Get());
+        // Avoid querying GetFrameStatistics on every frame. On some systems the
+        // query is unavailable (as reported by the previous N/D diagnostic),
+        // and keeping it in the hot path adds work without providing useful data.
+        // The main counter below measures unique frames successfully submitted.
 
         // Count only unique new frames successfully submitted by the main view.
         if (!compact && SUCCEEDED(presentHr) && lastUploadedSequence_ > lastCountedSequence_) {
@@ -2360,15 +2364,12 @@ public:
         frameView_.Reset();
         frameTexture_.Reset();
         frameWidth_ = frameHeight_ = 0;
-        frameHasMipmaps_ = false;
-        frameMipmapsRequested_ = false;
         lastUploadedSequence_ = 0;
         lastCountedSequence_ = 0;
     }
     void DestroyTarget(HWND hwnd) {
         if (mainTarget_.hwnd == hwnd) {
             ResetTarget(mainTarget_);
-            haveLastDisplayPresentCount_ = false;
         }
         if (pipTarget_.hwnd == hwnd) ResetTarget(pipTarget_);
     }
@@ -2377,7 +2378,6 @@ public:
     }
     void Destroy() {
         ResetTarget(mainTarget_); ResetTarget(pipTarget_); ClearFrame();
-        haveLastDisplayPresentCount_ = false;
         d2d_.Reset(); d2dDevice_.Reset(); d2dFactory_.Reset(); dwrite_.Reset();
         white_.Reset(); shadow_.Reset(); dim_.Reset(); button_.Reset(); cyan_.Reset(); red_.Reset();
         textFormat_.Reset(); statusFormat_.Reset(); sampler_.Reset(); ps_.Reset(); vs_.Reset();
@@ -2385,27 +2385,6 @@ public:
         disabled_ = false; failureLogged_ = false; failureStage_.clear(); failureHr_ = S_OK;
     }
 private:
-    void UpdateDisplayFrameStatistics(IDXGISwapChain3* swapChain) {
-        if (!swapChain) return;
-        DXGI_FRAME_STATISTICS statistics{};
-        const HRESULT hr = swapChain->GetFrameStatistics(&statistics);
-        if (SUCCEEDED(hr)) {
-            g_displayStatsSupported.store(true, std::memory_order_relaxed);
-            if (haveLastDisplayPresentCount_) {
-                const UINT delta = statistics.PresentCount - lastDisplayPresentCount_;
-                if (delta > 0) g_displayFramesInterval.fetch_add(delta, std::memory_order_relaxed);
-            }
-            lastDisplayPresentCount_ = statistics.PresentCount;
-            haveLastDisplayPresentCount_ = true;
-        } else if (hr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT) {
-            haveLastDisplayPresentCount_ = false;
-        } else if (!displayStatsFailureLogged_) {
-            displayStatsFailureLogged_ = true;
-            Log(L"DXGI GetFrameStatistics unavailable; HRESULT=" +
-                std::to_wstring(static_cast<unsigned long>(hr)));
-        }
-    }
-
     void SetFailure(const wchar_t* stage, HRESULT hr) {
         failureStage_ = stage ? stage : L"unknown renderer stage";
         failureHr_ = hr;
@@ -2565,21 +2544,6 @@ private:
         }
         return true;
     }
-    bool ShouldUseMipmaps(int sourceWidth, int sourceHeight) const {
-        auto isDownscaled = [sourceWidth, sourceHeight](HWND window) {
-            if (!window || !IsWindowVisible(window)) return false;
-            RECT rc{};
-            if (!GetClientRect(window, &rc)) return false;
-            const int width = std::max<LONG>(1, rc.right - rc.left);
-            const int height = std::max<LONG>(1, rc.bottom - rc.top);
-            // Mipmaps improve substantial reductions. At native or near-native
-            // size, avoid their per-frame generation cost altogether.
-            return width < static_cast<int>(sourceWidth * 0.90) ||
-                height < static_cast<int>(sourceHeight * 0.90);
-        };
-        return isDownscaled(g_hwnd) || isDownscaled(g_renderPipHwnd.load(std::memory_order_acquire));
-    }
-
     bool UploadLatestFrame() {
         FrameSlot* slot = AcquireLatestFrameForRead();
         if (!slot) return true;
@@ -2597,56 +2561,36 @@ private:
             return true;
         }
 
-        const bool wantMipmaps = ShouldUseMipmaps(w, h);
-        if (!frameTexture_ || frameWidth_ != w || frameHeight_ != h ||
-            frameMipmapsRequested_ != wantMipmaps) {
+        const size_t rowBytes = static_cast<size_t>(w) * 4u;
+        if (!frameTexture_ || frameWidth_ != w || frameHeight_ != h) {
             frameView_.Reset();
             frameTexture_.Reset();
-            frameHasMipmaps_ = false;
-            frameMipmapsRequested_ = wantMipmaps;
 
-            UINT formatSupport = 0;
-            const bool canGenerateMipmaps = wantMipmaps &&
-                SUCCEEDED(device_->CheckFormatSupport(DXGI_FORMAT_B8G8R8A8_UNORM, &formatSupport)) &&
-                (formatSupport & D3D11_FORMAT_SUPPORT_MIP_AUTOGEN) != 0;
-
+            // The capture image is replaced completely on every frame. A
+            // dynamic texture plus WRITE_DISCARD lets the D3D runtime provide
+            // fresh backing storage while the GPU may still be sampling the
+            // previous image, avoiding UpdateSubresource contention.
             D3D11_TEXTURE2D_DESC desc{};
             desc.Width = static_cast<UINT>(w);
             desc.Height = static_cast<UINT>(h);
-            desc.MipLevels = canGenerateMipmaps ? 0u : 1u;
+            desc.MipLevels = 1;
             desc.ArraySize = 1;
             desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
             desc.SampleDesc.Count = 1;
-            desc.Usage = D3D11_USAGE_DEFAULT;
+            desc.Usage = D3D11_USAGE_DYNAMIC;
             desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
             desc.MiscFlags = 0;
-            if (canGenerateMipmaps) {
-                desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
-                desc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
-            }
 
             ComPtr<ID3D11Texture2D> newTexture;
             ComPtr<ID3D11ShaderResourceView> newView;
             HRESULT hr = device_->CreateTexture2D(&desc, nullptr, &newTexture);
             if (SUCCEEDED(hr))
                 hr = device_->CreateShaderResourceView(newTexture.Get(), nullptr, &newView);
-
-            // Some drivers advertise autogen support but reject this particular
-            // resource configuration. Fall back to a single-level linear texture.
-            if (FAILED(hr) && canGenerateMipmaps) {
-                newView.Reset();
-                newTexture.Reset();
-                desc.MipLevels = 1;
-                desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-                desc.MiscFlags = 0;
-                hr = device_->CreateTexture2D(&desc, nullptr, &newTexture);
-                if (SUCCEEDED(hr))
-                    hr = device_->CreateShaderResourceView(newTexture.Get(), nullptr, &newView);
-            }
-
             if (FAILED(hr)) {
-                SetFailure(L"CreateTexture2D/CreateShaderResourceView", hr);
-                Log(L"Could not create the video texture; HRESULT=" + std::to_wstring(static_cast<unsigned long>(hr)));
+                SetFailure(L"Create dynamic video texture/CreateShaderResourceView", hr);
+                Log(L"Could not create the dynamic video texture; HRESULT=" +
+                    std::to_wstring(static_cast<unsigned long>(hr)));
                 slot->state.store(static_cast<int>(FrameSlotState::Ready), std::memory_order_release);
                 return false;
             }
@@ -2654,12 +2598,27 @@ private:
             frameView_ = std::move(newView);
             frameWidth_ = w;
             frameHeight_ = h;
-            frameHasMipmaps_ = canGenerateMipmaps && desc.MipLevels == 0;
         }
 
-        context_->UpdateSubresource(frameTexture_.Get(), 0, nullptr, slot->pixels.data(),
-            static_cast<UINT>(w * 4), 0);
-        if (frameHasMipmaps_) context_->GenerateMips(frameView_.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        const HRESULT mapHr = context_->Map(frameTexture_.Get(), 0,
+            D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (FAILED(mapHr) || !mapped.pData || mapped.RowPitch < rowBytes) {
+            if (SUCCEEDED(mapHr)) context_->Unmap(frameTexture_.Get(), 0);
+            SetFailure(L"ID3D11DeviceContext::Map dynamic video texture", FAILED(mapHr) ? mapHr : E_FAIL);
+            Log(L"Could not map the dynamic video texture; HRESULT=" +
+                std::to_wstring(static_cast<unsigned long>(FAILED(mapHr) ? mapHr : E_FAIL)));
+            slot->state.store(static_cast<int>(FrameSlotState::Ready), std::memory_order_release);
+            return false;
+        }
+
+        const BYTE* source = slot->pixels.data();
+        BYTE* destination = static_cast<BYTE*>(mapped.pData);
+        for (int row = 0; row < h; ++row) {
+            std::memcpy(destination + static_cast<size_t>(row) * mapped.RowPitch,
+                source + static_cast<size_t>(row) * rowBytes, rowBytes);
+        }
+        context_->Unmap(frameTexture_.Get(), 0);
         lastUploadedSequence_ = incomingSequence;
         ReleaseFrameSlot(slot);
         return true;
@@ -2674,7 +2633,6 @@ private:
     }
     void ResetDevice() {
         ResetTarget(mainTarget_); ResetTarget(pipTarget_); ClearFrame();
-        haveLastDisplayPresentCount_ = false;
         d2d_.Reset(); d2dDevice_.Reset(); d2dFactory_.Reset(); dwrite_.Reset();
         white_.Reset(); shadow_.Reset(); dim_.Reset(); button_.Reset(); cyan_.Reset(); red_.Reset();
         textFormat_.Reset(); statusFormat_.Reset(); sampler_.Reset(); ps_.Reset(); vs_.Reset();
@@ -2716,9 +2674,11 @@ private:
         const std::wstring firstLine = state.language == UiLanguage::English
             ? L"CAP " + std::to_wstring(state.captureFps) + L" | APP " + std::to_wstring(state.renderFps) + L" | DISPLAY " + display + L" | DROPPED " + std::to_wstring(state.droppedFps)
             : L"CAP " + std::to_wstring(state.captureFps) + L" | APP " + std::to_wstring(state.renderFps) + L" | MONITOR " + display + L" | DESCART. " + std::to_wstring(state.droppedFps);
+        const std::wstring backend = state.rendererBackend == 1 ? L"D3D11"
+            : state.rendererBackend == 2 ? L"GDI" : L"INIT";
         const std::wstring secondLine = state.language == UiLanguage::English
-            ? L"RENDER " + std::to_wstring(state.renderWorkTenthsMs / 10) + L"." + std::to_wstring(state.renderWorkTenthsMs % 10) + L" ms  |  PRESENT " + std::to_wstring(state.presentWaitTenthsMs / 10) + L"." + std::to_wstring(state.presentWaitTenthsMs % 10) + L" ms"
-            : L"RENDER " + std::to_wstring(state.renderWorkTenthsMs / 10) + L"." + std::to_wstring(state.renderWorkTenthsMs % 10) + L" ms  |  PRESENT " + std::to_wstring(state.presentWaitTenthsMs / 10) + L"." + std::to_wstring(state.presentWaitTenthsMs % 10) + L" ms";
+            ? L"BACKEND " + backend + L" | RENDER " + std::to_wstring(state.renderWorkMicroseconds) + L" us | PRESENT " + std::to_wstring(state.presentMicroseconds) + L" us"
+            : L"MOTOR " + backend + L" | RENDER " + std::to_wstring(state.renderWorkMicroseconds) + L" us | PRESENT " + std::to_wstring(state.presentMicroseconds) + L" us";
         const float right = static_cast<float>(std::max<LONG>(240, rc.right - 12));
         Text(firstLine, D2D1::RectF(12, 82, right, 104));
         Text(secondLine, D2D1::RectF(12, 104, right, 126));
@@ -2757,8 +2717,6 @@ private:
     ComPtr<ID3D11RasterizerState> rasterizer_;
     ComPtr<ID3D11Texture2D> frameTexture_;
     ComPtr<ID3D11ShaderResourceView> frameView_;
-    bool frameHasMipmaps_ = false;
-    bool frameMipmapsRequested_ = false;
     int frameWidth_ = 0, frameHeight_ = 0;
     uint64_t lastUploadedSequence_ = 0;
     uint64_t lastCountedSequence_ = 0;
@@ -2769,9 +2727,6 @@ private:
     ComPtr<IDWriteTextFormat> textFormat_, statusFormat_;
     ComPtr<ID2D1SolidColorBrush> white_, shadow_, dim_, button_, cyan_, red_;
     WindowTarget mainTarget_, pipTarget_;
-    UINT lastDisplayPresentCount_ = 0;
-    bool haveLastDisplayPresentCount_ = false;
-    bool displayStatsFailureLogged_ = false;
     bool disabled_ = false;
     bool failureLogged_ = false;
     std::wstring failureStage_ = L"initialization";
@@ -2861,6 +2816,9 @@ void DrawCompatibilityLabel(HDC dc, HFONT font, const std::wstring& text, RECT r
 
 bool DrawCompatibilityPreview(HDC target, HWND window, bool compact) {
     if (!target || !window) return false;
+    if (!compact) g_rendererBackend.store(2, std::memory_order_relaxed);
+    LARGE_INTEGER compatibilityStart{};
+    if (!compact) QueryPerformanceCounter(&compatibilityStart);
     PullLatestFrameForCompatibilityRenderer();
 
     RECT client{};
@@ -2937,17 +2895,32 @@ bool DrawCompatibilityPreview(HDC target, HWND window, bool compact) {
         const std::wstring stats = g_uiLanguage == UiLanguage::English
             ? L"CAP " + std::to_wstring(g_captureFps) + L" | APP " + std::to_wstring(g_renderFps) + L" | DISPLAY " + display + L" | DROPPED " + std::to_wstring(g_droppedFps)
             : L"CAP " + std::to_wstring(g_captureFps) + L" | APP " + std::to_wstring(g_renderFps) + L" | MONITOR " + display + L" | DESCART. " + std::to_wstring(g_droppedFps);
-        const std::wstring timing = g_uiLanguage == UiLanguage::English
-            ? L"RENDER " + std::to_wstring(g_renderWorkTenthsMs / 10) + L"." + std::to_wstring(g_renderWorkTenthsMs % 10) + L" ms | PRESENT " + std::to_wstring(g_presentWaitTenthsMs / 10) + L"." + std::to_wstring(g_presentWaitTenthsMs % 10) + L" ms"
-            : L"RENDER " + std::to_wstring(g_renderWorkTenthsMs / 10) + L"." + std::to_wstring(g_renderWorkTenthsMs % 10) + L" ms | PRESENT " + std::to_wstring(g_presentWaitTenthsMs / 10) + L"." + std::to_wstring(g_presentWaitTenthsMs % 10) + L" ms";
+        const int backendValue = g_rendererBackend.load(std::memory_order_relaxed);
+        const std::wstring backend = backendValue == 1 ? L"D3D11" : backendValue == 2 ? L"GDI" : L"INIT";
+        const std::wstring timing = (g_uiLanguage == UiLanguage::English ? L"BACKEND " : L"MOTOR ") + backend +
+            L" | RENDER " + std::to_wstring(g_renderWorkMicrosecondsAverage) + L" us | PRESENT " +
+            std::to_wstring(g_presentMicrosecondsAverage) + L" us";
         DrawCompatibilityLabel(buffer.dc, g_uiFont, stats, RECT{ 12, 82, std::max(240, width - 12), 104 });
         DrawCompatibilityLabel(buffer.dc, g_uiFont, timing, RECT{ 12, 104, std::max(240, width - 12), 126 });
     }
     if (compact && g_pipHover) DrawPipHoverActions(buffer.dc, window);
 
+    LARGE_INTEGER compatibilityRenderEnd{};
+    if (!compact) QueryPerformanceCounter(&compatibilityRenderEnd);
+    LARGE_INTEGER compatibilityPresentStart{};
+    if (!compact) QueryPerformanceCounter(&compatibilityPresentStart);
     const BOOL copied = BitBlt(target, 0, 0, width, height, buffer.dc, 0, 0, SRCCOPY);
+    LARGE_INTEGER compatibilityPresentEnd{};
+    if (!compact && copied) QueryPerformanceCounter(&compatibilityPresentEnd);
     if (copied && g_compatibilityFrameSequence > g_compatibilityLastPresentedSequence) {
         g_renderFramesInterval.fetch_add(1, std::memory_order_relaxed);
+        if (!compact) {
+            g_renderWorkMicrosecondsInterval.fetch_add(
+                QpcElapsedMicroseconds(compatibilityStart, compatibilityRenderEnd), std::memory_order_relaxed);
+            g_presentMicrosecondsInterval.fetch_add(
+                QpcElapsedMicroseconds(compatibilityPresentStart, compatibilityPresentEnd), std::memory_order_relaxed);
+            g_renderTimingSamplesInterval.fetch_add(1, std::memory_order_relaxed);
+        }
         g_compatibilityLastPresentedSequence = g_compatibilityFrameSequence;
     }
     return copied != FALSE;
@@ -3024,6 +2997,7 @@ void RenderWorkerMain() {
 
         if (renderFailed) {
             g_d3dRendererActive.store(false, std::memory_order_release);
+            g_rendererBackend.store(2, std::memory_order_release);
             // D3D has failed. Invalidate through Win32 so the UI thread paints
             // the retained GDI compatibility renderer without sharing D3D state.
             if (!fallbackInvalidated || waitResult == WAIT_OBJECT_0 + 1) {
@@ -3033,6 +3007,7 @@ void RenderWorkerMain() {
             }
         } else if (hasVisibleTarget && renderSucceeded) {
             g_d3dRendererActive.store(true, std::memory_order_release);
+            g_rendererBackend.store(1, std::memory_order_release);
             fallbackInvalidated = false;
         }
 
@@ -3040,6 +3015,7 @@ void RenderWorkerMain() {
 
     g_videoRenderer.Destroy();
     g_d3dRendererActive.store(false, std::memory_order_release);
+    g_rendererBackend.store(0, std::memory_order_release);
     if (SUCCEEDED(comHr)) CoUninitialize();
 }
 
@@ -3802,8 +3778,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                     g_renderFps = 0;
                     g_displayFps = g_displayStatsSupported.load(std::memory_order_relaxed) ? 0 : -1;
                     g_droppedFps = 0;
-                    g_renderWorkTenthsMs = 0;
-                    g_presentWaitTenthsMs = 0;
+                    g_renderWorkMicrosecondsAverage = 0;
+                    g_presentMicrosecondsAverage = 0;
                 } else {
                     g_captureFps = CalculateFramesPerSecond(captured, elapsed);
                     g_renderFps = std::min(CalculateFramesPerSecond(rendered, elapsed), g_captureFps);
@@ -3811,11 +3787,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                         ? CalculateFramesPerSecond(displayed, elapsed) : -1;
                     g_droppedFps = CalculateFramesPerSecond(dropped, elapsed);
                     if (timingSamples > 0) {
-                        g_renderWorkTenthsMs = static_cast<int>((renderWorkUs + timingSamples * 50ULL) / (timingSamples * 100ULL));
-                        g_presentWaitTenthsMs = static_cast<int>((presentUs + timingSamples * 50ULL) / (timingSamples * 100ULL));
+                        g_renderWorkMicrosecondsAverage = static_cast<int>((renderWorkUs + timingSamples / 2ULL) / timingSamples);
+                        g_presentMicrosecondsAverage = static_cast<int>((presentUs + timingSamples / 2ULL) / timingSamples);
                     } else {
-                        g_renderWorkTenthsMs = 0;
-                        g_presentWaitTenthsMs = 0;
+                        g_renderWorkMicrosecondsAverage = 0;
+                        g_presentMicrosecondsAverage = 0;
                     }
                 }
                 g_statsLastTick = now;
