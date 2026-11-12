@@ -13,6 +13,7 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,17 +31,26 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item build/Release/PlayView.exe dist/PlayView.exe
-          Compress-Archive -Path dist/* -DestinationPath PlayView-Windows-x64.zip -Force
 
+          Copy-Item build/Release/PlayView.exe dist/PlayView.exe
+
+          Compress-Archive `
+            -Path dist/PlayView.exe `
+            -DestinationPath PlayView-Windows-x64.zip `
+            -Force
+
+      # GitHub Actions genera automáticamente el ZIP del artefacto.
+      # Dentro estará directamente PlayView.exe.
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: PlayView-Windows-x64
-          path: PlayView-Windows-x64.zip
+          path: dist/PlayView.exe
           if-no-files-found: error
           retention-days: 30
 
+      # GitHub Releases recibe el ZIP de distribución,
+      # que contiene directamente PlayView.exe.
       - name: Publish GitHub Release on version tag
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
