@@ -206,7 +206,7 @@ const wchar_t* Tr(TextId id) {
     case TextId::HidePip: return en ? L"Hide Picture in Picture" : L"Ocultar imagen en imagen";
     case TextId::AlwaysOnTop: return en ? L"Always on top" : L"Siempre visible";
     case TextId::PipCreateFailed: return en ? L"Could not create the Picture in Picture window." : L"No se pudo crear la ventana de imagen en imagen.";
-    case TextId::AboutBody: return en ? L"PlayView 1.2.0\nA lightweight monitor for video capture devices.\n\nCapture powered by Windows Media Foundation and Direct3D 11." : L"PlayView 1.2.0\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation y Direct3D 11.";
+    case TextId::AboutBody: return en ? L"PlayView 1.2.1\nA lightweight monitor for video capture devices.\n\nCapture powered by Windows Media Foundation and Direct3D 11." : L"PlayView 1.2.1\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation y Direct3D 11.";
     case TextId::RendererUnavailable: return en ? L"The Direct3D 11 renderer could not be initialized. Check playview.log for details." : L"No se pudo iniciar el renderizador Direct3D 11. Consulta playview.log para más detalles.";
     case TextId::AboutTitle: return en ? L"About PlayView" : L"Acerca de PlayView";
     case TextId::MediaFoundationStartupError: return en ? L"Could not initialize Windows Media Foundation. Make sure Windows is up to date." : L"No se pudo iniciar Windows Media Foundation. Comprueba que Windows esté actualizado.";
@@ -275,6 +275,27 @@ struct FrameSlot {
     std::atomic<int> state{ static_cast<int>(FrameSlotState::Free) };
 };
 constexpr size_t kFrameSlotCount = 3;
+
+// GDI compatibility renderer backbuffers. They are only used if Direct3D 11
+// cannot initialize on the current PC or its swap-chain path fails. The
+// captured frame is cached on the UI thread so the main window and PiP can
+// both paint the same frame without consuming it twice.
+struct GdiPaintBuffer {
+    HDC dc = nullptr;
+    HBITMAP bitmap = nullptr;
+    HGDIOBJ previousBitmap = nullptr;
+    HBRUSH backgroundBrush = nullptr;
+    int width = 0;
+    int height = 0;
+    std::vector<BYTE> dimPixels;
+};
+GdiPaintBuffer g_mainGdiBuffer;
+GdiPaintBuffer g_pipGdiBuffer;
+std::vector<BYTE> g_compatibilityFramePixels;
+int g_compatibilityFrameWidth = 0;
+int g_compatibilityFrameHeight = 0;
+uint64_t g_compatibilityFrameSequence = 0;
+uint64_t g_compatibilityLastPresentedSequence = 0;
 
 HWND g_hwnd = nullptr;
 HWND g_pipHwnd = nullptr;
@@ -1147,7 +1168,12 @@ private:
         reader.Reset();
         if (source) source->Shutdown();
         if (!stopRequested_.load()) {
-            Log(L"La captura de video se interrumpio o perdio el dispositivo.");
+            std::wostringstream reason;
+            reason << L"La captura de video se interrumpio o perdio el dispositivo."
+                << L" HRESULT=0x" << std::hex << std::uppercase << static_cast<unsigned long>(hr)
+                << L" flags=0x" << static_cast<unsigned long>(flags)
+                << L" stream=" << std::dec << streamIndex;
+            Log(reason.str());
             PostMessageW(notifyWindow, WM_APP_VIDEO_LOST, 0, 0);
         }
         running_.store(false);
@@ -1869,14 +1895,22 @@ class VideoRenderer {
     };
 public:
     bool Render(HWND hwnd, bool compact) {
-        if (!EnsureDevice()) return false;
-        UploadLatestFrame();
+        if (disabled_) return false;
+        if (!EnsureDevice()) { DisableAfterFailure(); return false; }
         WindowTarget& t = compact ? pipTarget_ : mainTarget_;
-        if (!EnsureTarget(t, hwnd)) return false;
+        if (!EnsureTarget(t, hwnd)) { DisableAfterFailure(); return false; }
+        // Do not consume a CPU frame until both the D3D device and the target
+        // window are ready. If either setup step fails, GDI can still present
+        // the queued frame instead of showing a blank/error screen.
+        if (!UploadLatestFrame()) { DisableAfterFailure(); return false; }
 
         const UINT bufferIndex = t.swapChain->GetCurrentBackBufferIndex();
         if (bufferIndex >= static_cast<UINT>(t.rtvs.size()) ||
-            !t.rtvs[bufferIndex] || !t.d2dTargets[bufferIndex]) return false;
+            !t.rtvs[bufferIndex] || !t.d2dTargets[bufferIndex]) {
+            SetFailure(L"DXGI current back-buffer/view lookup", E_FAIL);
+            DisableAfterFailure();
+            return false;
+        }
 
         const float clear[4] = { 0.027f, 0.039f, 0.063f, 1.0f };
         ID3D11RenderTargetView* rtv = t.rtvs[bufferIndex].Get();
@@ -1923,21 +1957,27 @@ public:
         const HRESULT drawHr = d2d_->EndDraw();
         d2d_->SetTarget(nullptr);
         if (FAILED(drawHr)) {
-            Log(L"Direct2D overlay rendering failed: " + std::to_wstring(static_cast<unsigned long>(drawHr)));
+            SetFailure(L"Direct2D EndDraw", drawHr);
+            DisableAfterFailure();
             return false;
         }
 
         const HRESULT presentHr = t.swapChain->Present(compact ? 0 : 1, 0);
-        if (SUCCEEDED(presentHr) && !compact && lastUploadedSequence_ > lastCountedSequence_) {
+        if (SUCCEEDED(presentHr) && lastUploadedSequence_ > lastCountedSequence_) {
             g_renderFramesInterval.fetch_add(1, std::memory_order_relaxed);
             lastCountedSequence_ = lastUploadedSequence_;
         }
-        if (presentHr == DXGI_ERROR_DEVICE_REMOVED || presentHr == DXGI_ERROR_DEVICE_RESET) {
-            Log(L"Direct3D device was reset; renderer will be recreated.");
+        if (FAILED(presentHr)) {
+            HRESULT removedReason = device_ ? device_->GetDeviceRemovedReason() : E_FAIL;
+            SetFailure(L"DXGI swap-chain Present", presentHr);
+            if (removedReason != S_OK) {
+                Log(L"D3D11 device removed reason HRESULT=" + std::to_wstring(static_cast<unsigned long>(removedReason)));
+            }
+            DisableAfterFailure();
             ResetDevice();
             return false;
         }
-        return SUCCEEDED(presentHr);
+        return true;
     }
     void ClearFrame() {
         frameView_.Reset();
@@ -1957,11 +1997,29 @@ public:
         white_.Reset(); shadow_.Reset(); dim_.Reset(); button_.Reset(); cyan_.Reset(); red_.Reset();
         textFormat_.Reset(); statusFormat_.Reset(); sampler_.Reset(); ps_.Reset(); vs_.Reset();
         context_.Reset(); device_.Reset(); factory_.Reset(); initialized_ = false;
+        disabled_ = false; failureLogged_ = false; failureStage_.clear(); failureHr_ = S_OK;
     }
 private:
+    void SetFailure(const wchar_t* stage, HRESULT hr) {
+        failureStage_ = stage ? stage : L"unknown renderer stage";
+        failureHr_ = hr;
+    }
+    void DisableAfterFailure() {
+        disabled_ = true;
+        if (failureLogged_) return;
+        failureLogged_ = true;
+        std::wostringstream message;
+        message << L"Direct3D 11 renderer disabled at " << failureStage_
+            << L"; HRESULT=0x" << std::hex << std::uppercase
+            << static_cast<unsigned long>(failureHr_);
+        Log(message.str());
+    }
     bool EnsureDevice() {
         if (initialized_) return true;
-        const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_SINGLETHREADED;
+        // Keep the runtime's normal thread-safety support enabled. This is
+        // slightly more conservative for hybrid-GPU and D2D/DXGI drivers than
+        // D3D11_CREATE_DEVICE_SINGLETHREADED and avoids driver-specific issues.
+        const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
         const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
             D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
         D3D_FEATURE_LEVEL obtained{};
@@ -1977,13 +2035,15 @@ private:
             hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags,
                 levels + 1, static_cast<UINT>(std::size(levels) - 1), D3D11_SDK_VERSION, &device_, &obtained, &context_);
         }
-        if (FAILED(hr)) { Log(L"Direct3D 11 initialization failed: " + std::to_wstring(static_cast<unsigned long>(hr))); return false; }
+        if (FAILED(hr)) { SetFailure(L"D3D11CreateDevice (hardware and WARP)", hr); return false; }
         ComPtr<IDXGIDevice> dxgi;
         hr = device_.As(&dxgi);
+        if (FAILED(hr)) { SetFailure(L"QueryInterface IDXGIDevice", hr); return false; }
         ComPtr<IDXGIAdapter> adapter;
-        if (SUCCEEDED(hr)) hr = dxgi->GetAdapter(&adapter);
-        if (SUCCEEDED(hr)) hr = adapter->GetParent(IID_PPV_ARGS(&factory_));
-        if (FAILED(hr)) return false;
+        hr = dxgi->GetAdapter(&adapter);
+        if (FAILED(hr)) { SetFailure(L"IDXGIDevice::GetAdapter", hr); return false; }
+        hr = adapter->GetParent(IID_PPV_ARGS(&factory_));
+        if (FAILED(hr)) { SetFailure(L"IDXGIAdapter::GetParent IDXGIFactory2", hr); return false; }
 
         const char* shader =
             "struct O{float4 p:SV_POSITION;float2 uv:TEXCOORD0;};"
@@ -1998,17 +2058,17 @@ private:
             "PSMain", "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &errors);
         if (SUCCEEDED(hr)) hr = device_->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &vs_);
         if (SUCCEEDED(hr)) hr = device_->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &ps_);
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) { SetFailure(L"D3DCompile/CreateShader", hr); return false; }
         D3D11_SAMPLER_DESC sd{}; sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
         sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP; sd.MaxLOD = D3D11_FLOAT32_MAX;
         hr = device_->CreateSamplerState(&sd, &sampler_);
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) { SetFailure(L"ID3D11Device::CreateSamplerState", hr); return false; }
         D3D11_RASTERIZER_DESC rd{};
         rd.FillMode = D3D11_FILL_SOLID;
         rd.CullMode = D3D11_CULL_NONE;
         rd.DepthClipEnable = TRUE;
         hr = device_->CreateRasterizerState(&rd, &rasterizer_);
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) { SetFailure(L"ID3D11Device::CreateRasterizerState", hr); return false; }
         D2D1_FACTORY_OPTIONS options{};
         hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1),
             &options, reinterpret_cast<void**>(d2dFactory_.GetAddressOf()));
@@ -2028,7 +2088,7 @@ private:
         if (SUCCEEDED(hr)) hr = d2d_->CreateSolidColorBrush(D2D1::ColorF(0.12f,0.16f,0.22f,0.92f), &button_);
         if (SUCCEEDED(hr)) hr = d2d_->CreateSolidColorBrush(D2D1::ColorF(0.32f,0.78f,0.95f,1), &cyan_);
         if (SUCCEEDED(hr)) hr = d2d_->CreateSolidColorBrush(D2D1::ColorF(0.96f,0.36f,0.36f,1), &red_);
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) { SetFailure(L"Direct2D/DirectWrite device and overlay initialization", hr); return false; }
         initialized_ = true; return true;
     }
     bool EnsureTarget(WindowTarget& t, HWND hwnd) {
@@ -2052,8 +2112,9 @@ private:
                 desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
                 hr = factory_->CreateSwapChainForHwnd(device_.Get(), hwnd, &desc, nullptr, nullptr, &swapChain1);
             }
-            if (SUCCEEDED(hr)) hr = swapChain1.As(&t.swapChain);
-            if (FAILED(hr)) return false;
+            if (FAILED(hr)) { SetFailure(L"IDXGIFactory2::CreateSwapChainForHwnd", hr); return false; }
+            hr = swapChain1.As(&t.swapChain);
+            if (FAILED(hr)) { SetFailure(L"QueryInterface IDXGISwapChain3", hr); return false; }
             factory_->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
             t.hwnd = hwnd;
             t.width = w;
@@ -2065,7 +2126,7 @@ private:
             for (auto& target : t.d2dTargets) target.Reset();
             for (auto& view : t.rtvs) view.Reset();
             HRESULT hr = t.swapChain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
-            if (FAILED(hr)) return false;
+            if (FAILED(hr)) { SetFailure(L"IDXGISwapChain::ResizeBuffers", hr); return false; }
             t.width = w;
             t.height = h;
         }
@@ -2088,19 +2149,20 @@ private:
             if (FAILED(hr)) {
                 t.d2dTargets[index].Reset();
                 t.rtvs[index].Reset();
+                SetFailure(L"Create swap-chain back-buffer views/Direct2D target", hr);
                 return false;
             }
         }
         return true;
     }
-    void UploadLatestFrame() {
+    bool UploadLatestFrame() {
         FrameSlot* slot = AcquireLatestFrameForRead();
-        if (!slot) return;
+        if (!slot) return true;
         const int w = slot->width;
         const int h = slot->height;
         if (w <= 0 || h <= 0 || slot->pixels.empty()) {
             ReleaseFrameSlot(slot);
-            return;
+            return true;
         }
 
         if (!frameTexture_ || frameWidth_ != w || frameHeight_ != h) {
@@ -2150,9 +2212,12 @@ private:
             }
 
             if (FAILED(hr)) {
-                Log(L"Could not create the video texture: " + std::to_wstring(static_cast<unsigned long>(hr)));
-                ReleaseFrameSlot(slot);
-                return;
+                SetFailure(L"CreateTexture2D/CreateShaderResourceView", hr);
+                Log(L"Could not create the video texture; HRESULT=" + std::to_wstring(static_cast<unsigned long>(hr)));
+                // Return the slot to READY instead of freeing it. DrawPreview()
+                // can then consume it with the GDI fallback renderer.
+                slot->state.store(static_cast<int>(FrameSlotState::Ready), std::memory_order_release);
+                return false;
             }
             frameTexture_ = std::move(newTexture);
             frameView_ = std::move(newView);
@@ -2166,6 +2231,7 @@ private:
         if (frameHasMipmaps_) context_->GenerateMips(frameView_.Get());
         lastUploadedSequence_ = slot->sequence.load(std::memory_order_relaxed);
         ReleaseFrameSlot(slot);
+        return true;
     }
     void ResetTarget(WindowTarget& t) {
         if (d2d_) d2d_->SetTarget(nullptr);
@@ -2263,12 +2329,194 @@ private:
     ComPtr<IDWriteTextFormat> textFormat_, statusFormat_;
     ComPtr<ID2D1SolidColorBrush> white_, shadow_, dim_, button_, cyan_, red_;
     WindowTarget mainTarget_, pipTarget_;
+    bool disabled_ = false;
+    bool failureLogged_ = false;
+    std::wstring failureStage_ = L"initialization";
+    HRESULT failureHr_ = E_FAIL;
 };
 
 VideoRenderer g_videoRenderer;
 
-void DestroyPaintBuffer(HWND hwnd) { g_videoRenderer.DestroyTarget(hwnd); }
-bool DrawPreview(HWND, HWND window, bool compact = false) { return g_videoRenderer.Render(window, compact); }
+void DestroyGdiPaintBuffer(GdiPaintBuffer& buffer) {
+    if (buffer.dc && buffer.previousBitmap && buffer.previousBitmap != HGDI_ERROR)
+        SelectObject(buffer.dc, buffer.previousBitmap);
+    if (buffer.bitmap) DeleteObject(buffer.bitmap);
+    if (buffer.dc) DeleteDC(buffer.dc);
+    if (buffer.backgroundBrush) DeleteObject(buffer.backgroundBrush);
+    buffer = {};
+}
+
+bool EnsureGdiPaintBuffer(HDC reference, GdiPaintBuffer& buffer, int width, int height) {
+    if (!reference || width <= 0 || height <= 0) return false;
+    if (!buffer.dc) buffer.dc = CreateCompatibleDC(reference);
+    if (!buffer.dc) return false;
+    if (buffer.bitmap && buffer.width == width && buffer.height == height)
+        return buffer.backgroundBrush != nullptr;
+
+    if (buffer.bitmap) {
+        if (buffer.previousBitmap && buffer.previousBitmap != HGDI_ERROR)
+            SelectObject(buffer.dc, buffer.previousBitmap);
+        DeleteObject(buffer.bitmap);
+        buffer.bitmap = nullptr;
+        buffer.previousBitmap = nullptr;
+    }
+    buffer.bitmap = CreateCompatibleBitmap(reference, width, height);
+    if (!buffer.bitmap) return false;
+    buffer.previousBitmap = SelectObject(buffer.dc, buffer.bitmap);
+    if (!buffer.previousBitmap || buffer.previousBitmap == HGDI_ERROR) {
+        DeleteObject(buffer.bitmap);
+        buffer.bitmap = nullptr;
+        buffer.previousBitmap = nullptr;
+        return false;
+    }
+    if (!buffer.backgroundBrush) buffer.backgroundBrush = CreateSolidBrush(RGB(7, 10, 16));
+    buffer.width = width;
+    buffer.height = height;
+    return buffer.backgroundBrush != nullptr;
+}
+
+void ClearCompatibilityFrame() {
+    g_compatibilityFramePixels.clear();
+    g_compatibilityFrameWidth = 0;
+    g_compatibilityFrameHeight = 0;
+    g_compatibilityFrameSequence = 0;
+    g_compatibilityLastPresentedSequence = 0;
+}
+
+void PullLatestFrameForCompatibilityRenderer() {
+    FrameSlot* slot = AcquireLatestFrameForRead();
+    if (!slot) return;
+    const int width = slot->width;
+    const int height = slot->height;
+    const uint64_t sequence = slot->sequence.load(std::memory_order_relaxed);
+    if (width > 0 && height > 0 && !slot->pixels.empty()) {
+        try {
+            g_compatibilityFramePixels.assign(slot->pixels.begin(), slot->pixels.end());
+            g_compatibilityFrameWidth = width;
+            g_compatibilityFrameHeight = height;
+            g_compatibilityFrameSequence = sequence;
+        } catch (...) {
+            Log(L"GDI compatibility renderer could not allocate its frame cache.");
+        }
+    }
+    ReleaseFrameSlot(slot);
+}
+
+void DrawCompatibilityLabel(HDC dc, HFONT font, const std::wstring& text, RECT rect) {
+    if (text.empty()) return;
+    HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
+    const int oldMode = SetBkMode(dc, TRANSPARENT);
+    RECT shadow = rect;
+    OffsetRect(&shadow, 1, 1);
+    SetTextColor(dc, RGB(0, 0, 0));
+    DrawTextW(dc, text.c_str(), -1, &shadow, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SetTextColor(dc, RGB(245, 248, 252));
+    DrawTextW(dc, text.c_str(), -1, &rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SetBkMode(dc, oldMode);
+    if (oldFont) SelectObject(dc, oldFont);
+}
+
+bool DrawCompatibilityPreview(HDC target, HWND window, bool compact) {
+    if (!target || !window) return false;
+    PullLatestFrameForCompatibilityRenderer();
+
+    RECT client{};
+    GetClientRect(window, &client);
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    if (width <= 0 || height <= 0) return true;
+    GdiPaintBuffer& buffer = compact ? g_pipGdiBuffer : g_mainGdiBuffer;
+    if (!EnsureGdiPaintBuffer(target, buffer, width, height)) {
+        Log(L"GDI compatibility renderer could not create a backbuffer.");
+        return false;
+    }
+
+    FillRect(buffer.dc, &client, buffer.backgroundBrush);
+    if (g_compatibilityFrameWidth > 0 && g_compatibilityFrameHeight > 0 &&
+        !g_compatibilityFramePixels.empty()) {
+        const BYTE* pixels = g_compatibilityFramePixels.data();
+        if (compact && g_pipHover) {
+            try {
+                buffer.dimPixels = g_compatibilityFramePixels;
+                for (size_t i = 0; i + 3 < buffer.dimPixels.size(); i += 4) {
+                    buffer.dimPixels[i] = static_cast<BYTE>((buffer.dimPixels[i] * 45) / 100);
+                    buffer.dimPixels[i + 1] = static_cast<BYTE>((buffer.dimPixels[i + 1] * 45) / 100);
+                    buffer.dimPixels[i + 2] = static_cast<BYTE>((buffer.dimPixels[i + 2] * 45) / 100);
+                }
+                pixels = buffer.dimPixels.data();
+            } catch (...) {
+                pixels = g_compatibilityFramePixels.data();
+            }
+        }
+
+        const double scale = std::min(static_cast<double>(width) / g_compatibilityFrameWidth,
+                                      static_cast<double>(height) / g_compatibilityFrameHeight);
+        const int drawWidth = std::max(1, static_cast<int>(g_compatibilityFrameWidth * scale));
+        const int drawHeight = std::max(1, static_cast<int>(g_compatibilityFrameHeight * scale));
+        const int x = (width - drawWidth) / 2;
+        const int y = (height - drawHeight) / 2;
+        BITMAPINFO bitmapInfo{};
+        bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bitmapInfo.bmiHeader.biWidth = g_compatibilityFrameWidth;
+        bitmapInfo.bmiHeader.biHeight = -g_compatibilityFrameHeight;
+        bitmapInfo.bmiHeader.biPlanes = 1;
+        bitmapInfo.bmiHeader.biBitCount = 32;
+        bitmapInfo.bmiHeader.biCompression = BI_RGB;
+        SetStretchBltMode(buffer.dc, HALFTONE);
+        SetBrushOrgEx(buffer.dc, 0, 0, nullptr);
+        StretchDIBits(buffer.dc, x, y, drawWidth, drawHeight, 0, 0,
+            g_compatibilityFrameWidth, g_compatibilityFrameHeight, pixels,
+            &bitmapInfo, DIB_RGB_COLORS, SRCCOPY);
+    } else {
+        const std::wstring message = g_videoStatus.empty() ? Tr(TextId::VideoSelect) : g_videoStatus;
+        RECT statusRect = client;
+        DrawCompatibilityLabel(buffer.dc, g_uiFont, message, statusRect);
+    }
+
+    if (!compact && g_overlayVisible) {
+        const int clientWidth = width;
+        const int videoComboW = std::max(180, clientWidth / 3);
+        const int audioLabelX = 100 + videoComboW + 12;
+        const int audioComboX = audioLabelX + 48;
+        const int audioComboW = std::max(150, clientWidth - audioComboX - 315);
+        const int resLabelX = audioComboX + audioComboW + 10;
+        DrawCompatibilityLabel(buffer.dc, g_uiFont, Tr(TextId::CaptureDeviceLabel), RECT{ 12, 8, 96, 36 });
+        DrawCompatibilityLabel(buffer.dc, g_uiFont, Tr(TextId::AudioLabel), RECT{ audioLabelX, 8, audioLabelX + 46, 36 });
+        DrawCompatibilityLabel(buffer.dc, g_uiFont, Tr(TextId::ResolutionLabel), RECT{ resLabelX, 8, resLabelX + 82, 36 });
+        DrawCompatibilityLabel(buffer.dc, g_uiFont, std::wstring(Tr(TextId::VolumeLabel)) +
+            std::to_wstring(g_settings.volume) + L"%", RECT{ 12, 48, 124, 80 });
+        if (!g_statusText.empty()) DrawCompatibilityLabel(buffer.dc, g_uiFont, g_statusText,
+            RECT{ 600, 48, std::max(720, clientWidth - 12), 80 });
+    }
+
+    if (!compact && g_settings.showPerformanceStats) {
+        const std::wstring stats = g_uiLanguage == UiLanguage::English
+            ? L"CAP " + std::to_wstring(g_captureFps) + L" FPS  |  RENDER " + std::to_wstring(g_renderFps) + L" FPS  |  DROPPED " + std::to_wstring(g_droppedFps)
+            : L"CAPTURA " + std::to_wstring(g_captureFps) + L" FPS  |  RENDER " + std::to_wstring(g_renderFps) + L" FPS  |  PERDIDOS " + std::to_wstring(g_droppedFps);
+        DrawCompatibilityLabel(buffer.dc, g_uiFont, stats, RECT{ 12, 84, std::max(240, width - 12), 110 });
+    }
+    if (compact && g_pipHover) DrawPipHoverActions(buffer.dc, window);
+
+    const BOOL copied = BitBlt(target, 0, 0, width, height, buffer.dc, 0, 0, SRCCOPY);
+    if (copied && g_compatibilityFrameSequence > g_compatibilityLastPresentedSequence) {
+        g_renderFramesInterval.fetch_add(1, std::memory_order_relaxed);
+        g_compatibilityLastPresentedSequence = g_compatibilityFrameSequence;
+    }
+    return copied != FALSE;
+}
+
+void DestroyPaintBuffer(HWND hwnd) {
+    g_videoRenderer.DestroyTarget(hwnd);
+    if (hwnd == g_pipHwnd) DestroyGdiPaintBuffer(g_pipGdiBuffer);
+    if (hwnd == g_hwnd) DestroyGdiPaintBuffer(g_mainGdiBuffer);
+}
+bool DrawPreview(HDC target, HWND window, bool compact = false) {
+    if (g_videoRenderer.Render(window, compact)) return true;
+    // Do not leave the user with a blank preview if D3D11/DXGI is unavailable
+    // or rejected by the installed graphics driver. The GDI path is slower but
+    // deliberately retained as a compatibility safety net.
+    return DrawCompatibilityPreview(target, window, compact);
+}
 
 void DrawRendererFallback(HDC dc, HWND hwnd) {
     RECT rc{}; GetClientRect(hwnd, &rc);
@@ -2476,7 +2724,7 @@ LRESULT CALLBACK PipWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
-        if (!DrawPreview(hwnd, hwnd, true)) DrawRendererFallback(dc, hwnd);
+        if (!DrawPreview(dc, hwnd, true)) DrawRendererFallback(dc, hwnd);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -2814,6 +3062,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         break;
     case WM_APP_CLEAR_FRAME:
         g_videoRenderer.ClearFrame();
+        ClearCompatibilityFrame();
         InvalidateVideoSurface(hwnd);
         if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) InvalidateVideoSurface(g_pipHwnd);
         return 0;
@@ -2835,6 +3084,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         g_nextVideoRetry = GetTickCount64() + 2500;
         ClearQueuedFrames();
         g_videoRenderer.ClearFrame();
+        ClearCompatibilityFrame();
         UpdateStatusText();
         InvalidateVideoSurface(hwnd);
         if (g_pipHwnd && IsWindowVisible(g_pipHwnd)) InvalidateVideoSurface(g_pipHwnd);
@@ -2904,7 +3154,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
-        if (!DrawPreview(hwnd, hwnd, false)) DrawRendererFallback(dc, hwnd);
+        if (!DrawPreview(dc, hwnd, false)) DrawRendererFallback(dc, hwnd);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -2952,6 +3202,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         g_videoCapture.Stop();
         g_audioCapture.Stop();
         g_videoRenderer.Destroy();
+        DestroyGdiPaintBuffer(g_mainGdiBuffer);
+        DestroyGdiPaintBuffer(g_pipGdiBuffer);
+        ClearCompatibilityFrame();
         HideVolumeTooltip();
         if (g_volumeTooltip) { DestroyWindow(g_volumeTooltip); g_volumeTooltip = nullptr; }
         if (g_appMenu) { DestroyMenu(g_appMenu); g_appMenu = nullptr; }

@@ -1,4 +1,4 @@
-# PlayView 1.2.0 (English)
+# PlayView 1.2.1 (English)
 
 **PlayView** is a lightweight Windows capture-card monitor. It is designed to let you connect a game console, select the capture input, and play from a simple window without the extra features found in general-purpose media players.
 
@@ -24,7 +24,7 @@
 
 ### Performance and scaling
 
-- Uses Direct3D 11 to scale the captured image on the GPU with linear filtering and a generated mipmap chain for cleaner downscaling in windowed, fullscreen, and PiP modes. Drivers without mipmap-generation support use a single-level linear-filtered texture.
+- Uses Direct3D 11 to scale the captured image on the GPU with linear filtering and mipmaps when supported. If the installed graphics driver cannot initialize the D3D11/DXGI renderer, PlayView automatically falls back to a buffered GDI renderer so the preview remains usable.
 - Reuses Direct3D render-target views and Direct2D back-buffer targets between paints, recreating them only when a window is resized.
 - Keeps capture and presentation decoupled through a three-slot frame exchange. If the UI falls behind, older queued frames are dropped rather than building up latency.
 - Optional performance statistics show captured FPS, unique video frames presented by the main window, and dropped frames. Enable them from **View → Show performance statistics**.
@@ -106,7 +106,7 @@ PlayView is written in C++20 and uses native Windows components:
 
 - Windows Media Foundation for video and audio device discovery and capture.
 - WinMM (`waveOut`) for captured-audio playback.
-- Direct3D 11 and DXGI flip-model swap chains for GPU video scaling and presentation, including mipmap-based downscaling.
+- Direct3D 11 and DXGI flip-model swap chains for GPU video scaling and presentation, with a buffered GDI compatibility fallback.
 - Direct2D and DirectWrite for GPU-backed interface overlays and text.
 - An atomic three-slot frame exchange between the capture worker and the UI thread. Older ready frames are discarded when needed so the UI can display the newest available frame.
 - Windows Imaging Component for processing custom profile icons.
@@ -122,11 +122,11 @@ PlayView does not use Electron and does not require VLC, FFmpeg, or another medi
 
 ---
 
-**PlayView 1.2.0** · A lightweight capture-card monitor for Windows.
+**PlayView 1.2.1** · A lightweight capture-card monitor for Windows.
 
 ---
 
-# PlayView 1.2.0 (Español)
+# PlayView 1.2.1 (Español)
 
 **PlayView** es un monitor ligero de capturadoras para Windows. Está diseñado para conectar una consola, seleccionar la entrada de captura y jugar desde una ventana sencilla, sin las funciones adicionales de los reproductores multimedia de propósito general.
 
@@ -250,4 +250,4 @@ PlayView no utiliza Electron ni requiere tener instalado VLC, FFmpeg u otro repr
 
 ---
 
-**PlayView 1.2.0** · Un monitor ligero de capturadoras para Windows.
+**PlayView 1.2.1** · Un monitor ligero de capturadoras para Windows.
