@@ -230,7 +230,7 @@ const wchar_t* Tr(TextId id, UiLanguage language) {
     case TextId::HidePip: return en ? L"Hide Picture in Picture" : L"Ocultar imagen en imagen";
     case TextId::AlwaysOnTop: return en ? L"Always on top" : L"Siempre visible";
     case TextId::PipCreateFailed: return en ? L"Could not create the Picture in Picture window." : L"No se pudo crear la ventana de imagen en imagen.";
-    case TextId::AboutBody: return en ? L"PlayView 1.2.0\nA lightweight monitor for video capture devices.\n\nCapture powered by Windows Media Foundation and Direct3D 11." : L"PlayView 1.2.0\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation y Direct3D 11.";
+    case TextId::AboutBody: return en ? L"PlayView 1.3.0\nA lightweight monitor for video capture devices.\n\nCapture powered by Windows Media Foundation and Direct3D 11." : L"PlayView 1.3.0\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation y Direct3D 11.";
     case TextId::RendererUnavailable: return en ? L"The Direct3D 11 renderer could not be initialized. Check playview.log for details." : L"No se pudo iniciar el renderizador Direct3D 11. Consulta playview.log para más detalles.";
     case TextId::AboutTitle: return en ? L"About PlayView" : L"Acerca de PlayView";
     case TextId::MediaFoundationStartupError: return en ? L"Could not initialize Windows Media Foundation. Make sure Windows is up to date." : L"No se pudo iniciar Windows Media Foundation. Comprueba que Windows esté actualizado.";
@@ -1298,7 +1298,6 @@ private:
                 }
             }
             if (!sample) { Sleep(1); continue; }
-
             ComPtr<IMFMediaBuffer> buffer;
             // Use the contiguous sample buffer for compatibility with UVC
             // capture drivers. The direct GetBufferByIndex path introduced in
@@ -1523,6 +1522,14 @@ private:
             return;
         }
 
+        UINT outputDeviceId = 0;
+        if (waveOutGetID(output, &outputDeviceId) == MMSYSERR_NOERROR) {
+            WAVEOUTCAPSW outputCaps{};
+            if (waveOutGetDevCapsW(outputDeviceId, &outputCaps, sizeof(outputCaps)) == MMSYSERR_NOERROR)
+                Log(L"Salida de audio waveOut: " + std::wstring(outputCaps.szPname));
+        }
+
+        unsigned int audioSampleDiagnostics = 0;
         std::deque<std::unique_ptr<QueuedAudio>> queue;
         auto releaseFront = [&](bool wait) {
             if (queue.empty()) return;
@@ -1541,6 +1548,13 @@ private:
             hr = reader->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM), 0, &streamIndex, &flags, &timestamp, &sample);
             if (FAILED(hr) || (flags & MF_SOURCE_READERF_ERROR) || (flags & MF_SOURCE_READERF_ENDOFSTREAM)) break;
             if (!sample) { Sleep(1); continue; }
+            if (audioSampleDiagnostics < 5) {
+                LONGLONG sampleDuration = 0;
+                sample->GetSampleDuration(&sampleDuration);
+                Log(L"Audio MF sample: timestamp=" + std::to_wstring(timestamp / 10000) +
+                    L" ms, duration=" + std::to_wstring(sampleDuration / 10000) + L" ms");
+                ++audioSampleDiagnostics;
+            }
 
             ComPtr<IMFMediaBuffer> buffer;
             if (FAILED(sample->ConvertToContiguousBuffer(&buffer))) continue;
@@ -1549,28 +1563,57 @@ private:
             if (FAILED(buffer->Lock(&data, &maxLength, &currentLength))) continue;
             if (!data) { buffer->Unlock(); continue; }
             if (currentLength >= format.nBlockAlign) {
-                auto item = std::make_unique<QueuedAudio>();
+                // Do not submit an entire Media Foundation sample as one waveOut
+                // buffer. Capture drivers can return large samples (hundreds of ms
+                // or even seconds); queueing five such samples caused audio latency
+                // to grow to several seconds. Split the PCM stream into short
+                // 20 ms packets and keep at most five packets queued (about 100 ms).
                 const DWORD usableLength = currentLength - (currentLength % format.nBlockAlign);
-                item->bytes.resize(usableLength);
-                std::memcpy(item->bytes.data(), data, usableLength);
+                std::vector<char> pcm(usableLength);
+                std::memcpy(pcm.data(), data, usableLength);
                 buffer->Unlock();
 
                 const int volume = g_muted.load() ? 0 : g_volume.load();
-                auto* samples = reinterpret_cast<int16_t*>(item->bytes.data());
-                const size_t sampleCount = item->bytes.size() / sizeof(int16_t);
+                auto* samples = reinterpret_cast<int16_t*>(pcm.data());
+                const size_t sampleCount = pcm.size() / sizeof(int16_t);
                 for (size_t i = 0; i < sampleCount; ++i) {
                     const int scaled = static_cast<int>(samples[i]) * volume / 100;
                     samples[i] = static_cast<int16_t>(std::clamp(scaled, -32768, 32767));
                 }
-                item->header.lpData = item->bytes.data();
-                item->header.dwBufferLength = static_cast<DWORD>(item->bytes.size());
-                if (waveOutPrepareHeader(output, &item->header, sizeof(WAVEHDR)) == MMSYSERR_NOERROR &&
-                    waveOutWrite(output, &item->header, sizeof(WAVEHDR)) == MMSYSERR_NOERROR) {
-                    queue.push_back(std::move(item));
-                } else if (item->header.dwFlags & WHDR_PREPARED) {
-                    waveOutUnprepareHeader(output, &item->header, sizeof(WAVEHDR));
+
+                constexpr DWORD kAudioPacketMs = 20;
+                const DWORD packetBytes = (format.nAvgBytesPerSec * kAudioPacketMs / 1000);
+                const DWORD alignedPacketBytes = packetBytes - (packetBytes % format.nBlockAlign);
+                const DWORD maxQueuedPackets = 5; // 5 x 20 ms = approximately 100 ms.
+
+                for (DWORD offset = 0; offset < usableLength && !stopRequested_.load(); ) {
+                    while (queue.size() >= maxQueuedPackets && !stopRequested_.load())
+                        releaseFront(true);
+                    if (stopRequested_.load()) break;
+
+                    const DWORD chunkLength = std::min(alignedPacketBytes, usableLength - offset);
+                    auto item = std::make_unique<QueuedAudio>();
+                    item->bytes.resize(chunkLength);
+                    std::memcpy(item->bytes.data(), pcm.data() + offset, chunkLength);
+                    item->header.lpData = item->bytes.data();
+                    item->header.dwBufferLength = chunkLength;
+
+                    MMRESULT prepareResult = waveOutPrepareHeader(output, &item->header, sizeof(WAVEHDR));
+                    if (prepareResult == MMSYSERR_NOERROR) {
+                        const MMRESULT writeResult = waveOutWrite(output, &item->header, sizeof(WAVEHDR));
+                        if (writeResult == MMSYSERR_NOERROR) {
+                            queue.push_back(std::move(item));
+                            offset += chunkLength;
+                        } else {
+                            waveOutUnprepareHeader(output, &item->header, sizeof(WAVEHDR));
+                            Log(L"waveOutWrite falló. Código=" + std::to_wstring(writeResult));
+                            break;
+                        }
+                    } else {
+                        Log(L"waveOutPrepareHeader falló. Código=" + std::to_wstring(prepareResult));
+                        break;
+                    }
                 }
-                while (queue.size() >= 5 && !stopRequested_.load()) releaseFront(true);
             } else {
                 buffer->Unlock();
             }
