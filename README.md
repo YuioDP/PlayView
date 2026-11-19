@@ -13,6 +13,8 @@
 - Lets you choose from the formats and resolutions reported by the capture device's driver.
 - Preserves the source aspect ratio to prevent stretching or distortion.
 - Includes volume and mute controls, with the current level shown as a percentage.
+- Supports two selectable audio output engines: legacy WaveOut and WASAPI shared mode. The selected engine is saved with each profile.
+- Records audio capture timestamps, sample arrival intervals, submitted byte counts and output queue information in `playview.log` to help diagnose synchronization issues.
 - Provides capture reload and resynchronization commands.
 
 ### Display modes
@@ -57,7 +59,7 @@ PlayView includes Spanish and English. Open **Settings → Language** (shown as 
 - **Español:** forces the Spanish interface.
 - **English:** forces the English interface.
 
-The language preference is saved globally in `%LOCALAPPDATA%\PlayView\settings.ini`. It is independent of capture profiles, so switching between console profiles does not change the application language. The same setting is available from the fullscreen right-click context menu under **Settings → Language**. When Automatic is selected, PlayView re-checks the Windows UI language when Windows broadcasts a settings change.
+The audio output engine is selected from **Settings → Audio output** (or **Ajustes → Salida de audio**). WaveOut is retained for compatibility; WASAPI uses the default Windows multimedia output in shared mode. The selection is stored in the active configuration/profile. The language preference is saved globally in `%LOCALAPPDATA%\PlayView\settings.ini`. It is independent of capture profiles, so switching between console profiles does not change the application language. The same setting is available from the fullscreen right-click context menu under **Settings → Language**. When Automatic is selected, PlayView re-checks the Windows UI language when Windows broadcasts a settings change.
 
 ## First-time setup
 
@@ -110,7 +112,7 @@ Available resolutions and frame rates depend on the connected device and its dri
 PlayView is written in C++20 and uses native Windows components:
 
 - Windows Media Foundation for video and audio device discovery and capture.
-- WinMM (`waveOut`) for captured-audio playback.
+- WinMM (`waveOut`) and Windows Audio Session API (WASAPI shared mode) as selectable captured-audio output engines.
 - Direct3D 11 and DXGI flip-model swap chains for GPU video scaling and presentation, with a buffered GDI compatibility fallback.
 - Direct2D and DirectWrite for GPU-backed interface overlays and text.
 - An atomic three-slot frame exchange between the capture worker and the UI thread. Older ready frames are discarded when needed so the UI can display the newest available frame.
@@ -121,7 +123,7 @@ PlayView does not use Electron and does not require VLC, FFmpeg, or another medi
 
 ## Known limitations
 
-- Capture audio is played through the default Windows output device. The audio selector in PlayView selects the capture card's input device.
+- Both output engines currently use the default Windows multimedia output device. The audio selector in PlayView selects the capture card's input device. WASAPI shared mode is an alternative output path, not a guarantee of eliminating latency on every driver.
 - The **Resynchronize** command restarts audio and video capture; it does not provide a manual offset adjustment in milliseconds.
 - Some capture cards continue sending black frames when there is no HDMI input. On those devices, Windows may not provide enough information to distinguish a black image from a missing HDMI signal.
 - Profiles and shortcuts depend on the location of the executable and PlayView's data folder. If you move the program, you may need to recreate the shortcuts.
@@ -147,6 +149,8 @@ PlayView does not use Electron and does not require VLC, FFmpeg, or another medi
 - Permite elegir entre los formatos y las resoluciones que ofrece el controlador de la capturadora.
 - Conserva la proporción de imagen original para evitar estiramientos o deformaciones.
 - Incluye controles de volumen y silencio, con el nivel actual indicado en porcentaje.
+- Permite elegir entre dos motores de salida de audio: WaveOut clásico y WASAPI en modo compartido. La selección se guarda en cada perfil.
+- Registra marcas de tiempo de captura, intervalos de llegada de muestras, bytes enviados y datos de la cola de salida en `playview.log` para diagnosticar problemas de sincronización.
 - Permite recargar la captura y ejecutar una resincronización.
 
 ### Modos de visualización
@@ -191,7 +195,7 @@ PlayView incluye español e inglés. Abre **Ajustes → Idioma** (mostrado como 
 - **Español:** fuerza la interfaz en español.
 - **English:** fuerza la interfaz en inglés.
 
-La preferencia de idioma se guarda de forma global en `%LOCALAPPDATA%\PlayView\settings.ini`. Es independiente de los perfiles de captura, por lo que cambiar entre perfiles de consolas no modifica el idioma de la aplicación. La misma opción está disponible en el menú contextual que aparece al hacer clic derecho en pantalla completa, dentro de **Ajustes → Idioma**. Cuando se selecciona Automático, PlayView vuelve a comprobar el idioma de la interfaz de Windows cuando el sistema notifica un cambio de configuración.
+El motor de salida de audio se selecciona desde **Ajustes → Salida de audio** (o **Settings → Audio output**). WaveOut se conserva por compatibilidad; WASAPI utiliza la salida multimedia predeterminada de Windows en modo compartido. La selección se guarda en la configuración o perfil activo. La preferencia de idioma se guarda de forma global en `%LOCALAPPDATA%\PlayView\settings.ini`. Es independiente de los perfiles de captura, por lo que cambiar entre perfiles de consolas no modifica el idioma de la aplicación. La misma opción está disponible en el menú contextual que aparece al hacer clic derecho en pantalla completa, dentro de **Ajustes → Idioma**. Cuando se selecciona Automático, PlayView vuelve a comprobar el idioma de la interfaz de Windows cuando el sistema notifica un cambio de configuración.
 
 ## Primer uso
 
@@ -244,7 +248,7 @@ Las resoluciones y frecuencias de fotogramas disponibles dependen del dispositiv
 PlayView está desarrollado en C++20 y utiliza componentes nativos de Windows:
 
 - Windows Media Foundation para detectar dispositivos de video y audio y realizar la captura.
-- WinMM (`waveOut`) para reproducir el audio capturado.
+- WinMM (`waveOut`) y Windows Audio Session API (WASAPI en modo compartido) como motores seleccionables para reproducir el audio capturado.
 - Direct3D 11 y swap chains DXGI flip-model para el escalado y la presentación de video mediante GPU, incluida la reducción de tamaño mediante filtrado lineal.
 - Direct2D y DirectWrite para las superposiciones y los textos de la interfaz acelerados por GPU.
 - Un intercambio atómico de fotogramas de tres búferes entre el hilo de captura y el hilo de renderizado. Cuando es necesario, se descartan fotogramas antiguos para presentar el más reciente disponible.

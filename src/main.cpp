@@ -14,6 +14,7 @@
 #include <mfreadwrite.h>
 #include <mferror.h>
 #include <mmdeviceapi.h>
+#include <audioclient.h>
 #include <mmsystem.h>
 #include <wrl/client.h>
 #include <shellapi.h>
@@ -96,6 +97,8 @@ constexpr int IDM_LANGUAGE_AUTOMATIC = 2700;
 constexpr int IDM_LANGUAGE_SPANISH = 2701;
 constexpr int IDM_LANGUAGE_ENGLISH = 2702;
 constexpr int IDM_SHOW_PERFORMANCE_STATS = 2703;
+constexpr int IDM_AUDIO_OUTPUT_WAVEOUT = 2710;
+constexpr int IDM_AUDIO_OUTPUT_WASAPI = 2711;
 constexpr int IDC_ABOUT_OK = 2800;
 constexpr int ID_PROFILE_MENU_LIMIT = 100;
 
@@ -230,7 +233,7 @@ const wchar_t* Tr(TextId id, UiLanguage language) {
     case TextId::HidePip: return en ? L"Hide Picture in Picture" : L"Ocultar imagen en imagen";
     case TextId::AlwaysOnTop: return en ? L"Always on top" : L"Siempre visible";
     case TextId::PipCreateFailed: return en ? L"Could not create the Picture in Picture window." : L"No se pudo crear la ventana de imagen en imagen.";
-    case TextId::AboutBody: return en ? L"PlayView 1.3.0\nA lightweight monitor for video capture devices.\n\nCapture powered by Windows Media Foundation and Direct3D 11." : L"PlayView 1.3.0\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation y Direct3D 11.";
+    case TextId::AboutBody: return en ? L"PlayView 1.3.0\nA lightweight monitor for video capture devices.\n\nCapture powered by Windows Media Foundation and Direct3D 11. Audio output: WaveOut or WASAPI shared mode." : L"PlayView 1.3.0\nMonitor ligero para capturadoras de video.\n\nCaptura mediante Windows Media Foundation y Direct3D 11. Salida de audio: WaveOut o WASAPI compartido.";
     case TextId::RendererUnavailable: return en ? L"The Direct3D 11 renderer could not be initialized. Check playview.log for details." : L"No se pudo iniciar el renderizador Direct3D 11. Consulta playview.log para más detalles.";
     case TextId::AboutTitle: return en ? L"About PlayView" : L"Acerca de PlayView";
     case TextId::MediaFoundationStartupError: return en ? L"Could not initialize Windows Media Foundation. Make sure Windows is up to date." : L"No se pudo iniciar Windows Media Foundation. Comprueba que Windows esté actualizado.";
@@ -280,6 +283,7 @@ struct Settings {
     int height = 0;
     int volume = 80;
     bool muted = false;
+    int audioOutputBackend = 0; // 0=WaveOut, 1=WASAPI shared mode
     int windowMode = 0; // 0 windowed, 2 fullscreen (1 was the removed borderless mode)
     bool showToolbar = true;
     bool showPerformanceStats = false;
@@ -647,6 +651,7 @@ void LoadSettingsFrom(const std::filesystem::path& path) {
     g_settings.height = ReadIniInt(L"Video", L"Height", 0);
     g_settings.volume = std::clamp(ReadIniInt(L"Audio", L"Volume", 80), 0, 100);
     g_settings.muted = ReadIniInt(L"Audio", L"Muted", 0) != 0;
+    g_settings.audioOutputBackend = std::clamp(ReadIniInt(L"Audio", L"OutputBackend", 0), 0, 1);
     const int savedWindowMode = ReadIniInt(L"Window", L"Mode", 0);
     // Mode 1 used to mean borderless. It has been removed, so old settings
     // safely migrate to the regular windowed mode.
@@ -687,6 +692,7 @@ void SaveSettingsTo(const std::filesystem::path& path) {
     WriteIniString(L"Video", L"Height", std::to_wstring(g_settings.height));
     WriteIniString(L"Audio", L"Volume", std::to_wstring(g_settings.volume));
     WriteIniString(L"Audio", L"Muted", g_settings.muted ? L"1" : L"0");
+    WriteIniString(L"Audio", L"OutputBackend", std::to_wstring(g_settings.audioOutputBackend));
     WriteIniString(L"Window", L"Mode", std::to_wstring(g_windowMode));
     WriteIniString(L"Window", L"ShowToolbar", g_settings.showToolbar ? L"1" : L"0");
     WriteIniString(L"Diagnostics", L"ShowPerformanceStats", g_settings.showPerformanceStats ? L"1" : L"0");
@@ -1444,12 +1450,12 @@ public:
     ~AudioCapture() { Stop(); }
     bool IsRunning() const { return running_.load(); }
 
-    void Start(HWND notifyWindow, const std::wstring& endpointId) {
+    void Start(HWND notifyWindow, const std::wstring& endpointId, int outputBackend) {
         Stop();
         if (endpointId.empty()) return;
         stopRequested_.store(false);
         running_.store(true);
-        worker_ = std::thread([this, notifyWindow, endpointId]() { Run(notifyWindow, endpointId); });
+        worker_ = std::thread([this, notifyWindow, endpointId, outputBackend]() { Run(notifyWindow, endpointId, outputBackend); });
     }
 
     void Stop() {
@@ -1467,7 +1473,7 @@ private:
         WAVEHDR header{};
     };
 
-    void Run(HWND notifyWindow, const std::wstring& endpointId) {
+    void Run(HWND notifyWindow, const std::wstring& endpointId, int outputBackend) {
         const HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         ComPtr<IMFMediaSource> source;
         ComPtr<IMFSourceReader> reader;
@@ -1509,7 +1515,36 @@ private:
         format.wBitsPerSample = 16;
         format.nBlockAlign = 4;
         format.nAvgBytesPerSec = 192000;
-        if (SUCCEEDED(hr)) hr = waveOutOpen(&output, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL);
+        ComPtr<IAudioClient> wasapiClient;
+        ComPtr<IAudioRenderClient> wasapiRender;
+        UINT32 wasapiBufferFrames = 0;
+        bool wasapiStarted = false;
+        if (SUCCEEDED(hr) && outputBackend == 1) {
+            ComPtr<IMMDeviceEnumerator> enumerator;
+            ComPtr<IMMDevice> endpoint;
+            hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                IID_PPV_ARGS(&enumerator));
+            if (SUCCEEDED(hr)) hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &endpoint);
+            if (SUCCEEDED(hr)) hr = endpoint->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                reinterpret_cast<void**>(wasapiClient.GetAddressOf()));
+            if (SUCCEEDED(hr)) hr = wasapiClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_NOPERSIST, 1000000, 0, &format, nullptr);
+            if (SUCCEEDED(hr)) hr = wasapiClient->GetBufferSize(&wasapiBufferFrames);
+            if (SUCCEEDED(hr)) hr = wasapiClient->GetService(IID_PPV_ARGS(&wasapiRender));
+            if (SUCCEEDED(hr)) hr = wasapiClient->Start();
+            if (SUCCEEDED(hr)) wasapiStarted = true;
+            if (SUCCEEDED(hr)) {
+                LPWSTR endpointIdText = nullptr;
+                std::wstring endpointDescription = L"dispositivo predeterminado multimedia";
+                if (SUCCEEDED(endpoint->GetId(&endpointIdText)) && endpointIdText) {
+                    endpointDescription = endpointIdText;
+                    CoTaskMemFree(endpointIdText);
+                }
+                Log(L"Salida de audio WASAPI: " + endpointDescription + L", modo compartido; búfer=" + std::to_wstring(wasapiBufferFrames) + L" frames (" + std::to_wstring(static_cast<unsigned long long>(wasapiBufferFrames) * 1000 / format.nSamplesPerSec) + L" ms)");
+            }
+        } else if (SUCCEEDED(hr)) {
+            hr = waveOutOpen(&output, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL);
+        }
 
         if (FAILED(hr)) {
             Log(L"No se pudo iniciar la captura de audio. HRESULT=" + std::to_wstring(static_cast<unsigned long>(hr)));
@@ -1522,13 +1557,21 @@ private:
             return;
         }
 
-        UINT outputDeviceId = 0;
-        if (waveOutGetID(output, &outputDeviceId) == MMSYSERR_NOERROR) {
-            WAVEOUTCAPSW outputCaps{};
-            if (waveOutGetDevCapsW(outputDeviceId, &outputCaps, sizeof(outputCaps)) == MMSYSERR_NOERROR)
-                Log(L"Salida de audio waveOut: " + std::wstring(outputCaps.szPname));
+        if (outputBackend == 0) {
+            UINT outputDeviceId = 0;
+            if (waveOutGetID(output, &outputDeviceId) == MMSYSERR_NOERROR) {
+                WAVEOUTCAPSW outputCaps{};
+                if (waveOutGetDevCapsW(outputDeviceId, &outputCaps, sizeof(outputCaps)) == MMSYSERR_NOERROR)
+                    Log(L"Salida de audio WaveOut: " + std::wstring(outputCaps.szPname));
+            }
         }
 
+        const ULONGLONG audioStartTick = GetTickCount64();
+        ULONGLONG lastDiagnosticsTick = audioStartTick;
+        ULONGLONG lastSampleArrivalTick = 0;
+        LONGLONG lastMfTimestamp = -1;
+        unsigned long long totalCapturedBytes = 0;
+        unsigned long long totalSubmittedBytes = 0;
         unsigned int audioSampleDiagnostics = 0;
         std::deque<std::unique_ptr<QueuedAudio>> queue;
         auto releaseFront = [&](bool wait) {
@@ -1548,11 +1591,18 @@ private:
             hr = reader->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM), 0, &streamIndex, &flags, &timestamp, &sample);
             if (FAILED(hr) || (flags & MF_SOURCE_READERF_ERROR) || (flags & MF_SOURCE_READERF_ENDOFSTREAM)) break;
             if (!sample) { Sleep(1); continue; }
+            const ULONGLONG sampleArrivalTick = GetTickCount64();
+            const ULONGLONG arrivalGap = lastSampleArrivalTick ? sampleArrivalTick - lastSampleArrivalTick : 0;
+            const LONGLONG mfGapMs = lastMfTimestamp >= 0 ? (timestamp - lastMfTimestamp) / 10000 : 0;
+            lastSampleArrivalTick = sampleArrivalTick;
+            lastMfTimestamp = timestamp;
             if (audioSampleDiagnostics < 5) {
                 LONGLONG sampleDuration = 0;
                 sample->GetSampleDuration(&sampleDuration);
                 Log(L"Audio MF sample: timestamp=" + std::to_wstring(timestamp / 10000) +
-                    L" ms, duration=" + std::to_wstring(sampleDuration / 10000) + L" ms");
+                    L" ms, duration=" + std::to_wstring(sampleDuration / 10000) + L" ms, llegada=" +
+                    std::to_wstring(sampleArrivalTick - audioStartTick) + L" ms, intervaloLlegada=" +
+                    std::to_wstring(arrivalGap) + L" ms, intervaloMF=" + std::to_wstring(mfGapMs) + L" ms");
                 ++audioSampleDiagnostics;
             }
 
@@ -1569,6 +1619,7 @@ private:
                 // to grow to several seconds. Split the PCM stream into short
                 // 20 ms packets and keep at most five packets queued (about 100 ms).
                 const DWORD usableLength = currentLength - (currentLength % format.nBlockAlign);
+                totalCapturedBytes += usableLength;
                 std::vector<char> pcm(usableLength);
                 std::memcpy(pcm.data(), data, usableLength);
                 buffer->Unlock();
@@ -1581,6 +1632,28 @@ private:
                     samples[i] = static_cast<int16_t>(std::clamp(scaled, -32768, 32767));
                 }
 
+                if (outputBackend == 1) {
+                    const UINT32 frames = usableLength / format.nBlockAlign;
+                    UINT32 offsetFrames = 0;
+                    while (offsetFrames < frames && !stopRequested_.load()) {
+                        UINT32 padding = 0;
+                        HRESULT paddingHr = wasapiClient->GetCurrentPadding(&padding);
+                        if (FAILED(paddingHr)) { Log(L"WASAPI GetCurrentPadding falló: " + std::to_wstring(static_cast<unsigned long>(paddingHr))); break; }
+                        const UINT32 available = wasapiBufferFrames > padding ? wasapiBufferFrames - padding : 0;
+                        if (available == 0) { Sleep(2); continue; }
+                        const UINT32 chunkFrames = std::min<UINT32>(available, frames - offsetFrames);
+                        BYTE* destination = nullptr;
+                        HRESULT getBufferHr = wasapiRender->GetBuffer(chunkFrames, &destination);
+                        if (FAILED(getBufferHr)) { Log(L"WASAPI GetBuffer falló: " + std::to_wstring(static_cast<unsigned long>(getBufferHr))); break; }
+                        const size_t byteOffset = static_cast<size_t>(offsetFrames) * format.nBlockAlign;
+                        const size_t byteCount = static_cast<size_t>(chunkFrames) * format.nBlockAlign;
+                        std::memcpy(destination, pcm.data() + byteOffset, byteCount);
+                        HRESULT releaseHr = wasapiRender->ReleaseBuffer(chunkFrames, 0);
+                        if (FAILED(releaseHr)) { Log(L"WASAPI ReleaseBuffer falló: " + std::to_wstring(static_cast<unsigned long>(releaseHr))); break; }
+                        offsetFrames += chunkFrames;
+                        totalSubmittedBytes += byteCount;
+                    }
+                } else {
                 constexpr DWORD kAudioPacketMs = 20;
                 const DWORD packetBytes = (format.nAvgBytesPerSec * kAudioPacketMs / 1000);
                 const DWORD alignedPacketBytes = packetBytes - (packetBytes % format.nBlockAlign);
@@ -1604,6 +1677,7 @@ private:
                         if (writeResult == MMSYSERR_NOERROR) {
                             queue.push_back(std::move(item));
                             offset += chunkLength;
+                            totalSubmittedBytes += chunkLength;
                         } else {
                             waveOutUnprepareHeader(output, &item->header, sizeof(WAVEHDR));
                             Log(L"waveOutWrite falló. Código=" + std::to_wstring(writeResult));
@@ -1614,14 +1688,29 @@ private:
                         break;
                     }
                 }
+                }
             } else {
                 buffer->Unlock();
             }
+            if (sampleArrivalTick - lastDiagnosticsTick >= 5000) {
+                Log(L"Audio diagnóstico (" + std::wstring(outputBackend == 1 ? L"WASAPI" : L"WaveOut") +
+                    L"): transcurrido=" + std::to_wstring(sampleArrivalTick - audioStartTick) +
+                    L" ms, capturado=" + std::to_wstring(totalCapturedBytes) + L" bytes, enviado=" +
+                    std::to_wstring(totalSubmittedBytes) + L" bytes, colaWaveOut=" + std::to_wstring(queue.size()) +
+                    L", último intervalo MF=" + std::to_wstring(mfGapMs) + L" ms");
+                lastDiagnosticsTick = sampleArrivalTick;
+            }
         }
 
-        waveOutReset(output);
-        while (!queue.empty()) releaseFront(true);
-        waveOutClose(output);
+        if (outputBackend == 1) {
+            if (wasapiStarted) wasapiClient->Stop();
+            wasapiRender.Reset();
+            wasapiClient.Reset();
+        } else {
+            waveOutReset(output);
+            while (!queue.empty()) releaseFront(true);
+            waveOutClose(output);
+        }
         reader.Reset();
         if (source) source->Shutdown();
         if (!stopRequested_.load()) PostMessageW(notifyWindow, WM_APP_AUDIO_LOST, 0, 0);
@@ -1920,7 +2009,7 @@ void RefreshDevices(bool initial) {
         g_videoHasFrame.store(false);
         g_videoCapture.Start(g_hwnd, g_settings.videoId, g_settings.width, g_settings.height);
     }
-    if (startAudioNow) g_audioCapture.Start(g_hwnd, g_settings.audioId);
+    if (startAudioNow) g_audioCapture.Start(g_hwnd, g_settings.audioId, g_settings.audioOutputBackend);
     UpdateStatusText();
 }
 
@@ -1962,7 +2051,7 @@ void StartSelectedAudio(bool showErrorIfMissing = false) {
         g_nextAudioRetry = GetTickCount64() + 3000;
     } else {
         g_audioStatus = Tr(TextId::AudioConnected);
-        g_audioCapture.Start(g_hwnd, g_settings.audioId);
+        g_audioCapture.Start(g_hwnd, g_settings.audioId, g_settings.audioOutputBackend);
     }
     UpdateStatusText();
 }
@@ -2161,6 +2250,10 @@ void CreateAppMenu(HWND hwnd) {
         IDM_LANGUAGE_ENGLISH, Tr(TextId::LanguageEnglish));
 
     AppendMenuW(settings, MF_POPUP, reinterpret_cast<UINT_PTR>(language), Tr(TextId::LanguageMenu));
+    HMENU audioOutput = CreatePopupMenu();
+    AppendMenuW(audioOutput, MF_STRING | (g_settings.audioOutputBackend == 0 ? MF_CHECKED : MF_UNCHECKED), IDM_AUDIO_OUTPUT_WAVEOUT, L"WaveOut (compatibilidad)");
+    AppendMenuW(audioOutput, MF_STRING | (g_settings.audioOutputBackend == 1 ? MF_CHECKED : MF_UNCHECKED), IDM_AUDIO_OUTPUT_WASAPI, L"WASAPI (compartido)");
+    AppendMenuW(settings, MF_POPUP, reinterpret_cast<UINT_PTR>(audioOutput), L"Salida de audio");
     AppendMenuW(help, MF_STRING, IDM_ABOUT, Tr(TextId::About));
 
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(file), Tr(TextId::FileMenu));
@@ -3719,6 +3812,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case IDM_LANGUAGE_ENGLISH:
             ApplyLanguageChange(LanguagePreference::English);
             return 0;
+        case IDM_AUDIO_OUTPUT_WAVEOUT:
+        case IDM_AUDIO_OUTPUT_WASAPI:
+            g_settings.audioOutputBackend = (commandId == IDM_AUDIO_OUTPUT_WASAPI) ? 1 : 0;
+            SaveSettings();
+            StartSelectedAudio(false);
+            RequestMenuRebuild();
+            return 0;
         }
         break;
     }
@@ -3887,7 +3987,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             if (!g_settings.audioId.empty() && !g_audioCapture.IsRunning() && now >= g_nextAudioRetry) {
                 // Keep using only the saved endpoint ID. A retry never selects a
                 // different microphone or capture card audio endpoint.
-                g_audioCapture.Start(hwnd, g_settings.audioId);
+                g_audioCapture.Start(hwnd, g_settings.audioId, g_settings.audioOutputBackend);
                 g_audioStatus = Tr(TextId::AudioConnected);
                 g_nextAudioRetry = now + 4000;
                 UpdateStatusText();
@@ -3922,6 +4022,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         AppendMenuW(language, MF_STRING | (g_languagePreference == LanguagePreference::English ? MF_CHECKED : MF_UNCHECKED),
             IDM_LANGUAGE_ENGLISH, Tr(TextId::LanguageEnglish));
         AppendMenuW(settings, MF_POPUP, reinterpret_cast<UINT_PTR>(language), Tr(TextId::LanguageMenu));
+        HMENU audioOutput = CreatePopupMenu();
+        AppendMenuW(audioOutput, MF_STRING | (g_settings.audioOutputBackend == 0 ? MF_CHECKED : MF_UNCHECKED), IDM_AUDIO_OUTPUT_WAVEOUT, L"WaveOut (compatibilidad)");
+        AppendMenuW(audioOutput, MF_STRING | (g_settings.audioOutputBackend == 1 ? MF_CHECKED : MF_UNCHECKED), IDM_AUDIO_OUTPUT_WASAPI, L"WASAPI (compartido)");
+        AppendMenuW(settings, MF_POPUP, reinterpret_cast<UINT_PTR>(audioOutput), L"Salida de audio");
         AppendMenuW(context, MF_POPUP, reinterpret_cast<UINT_PTR>(settings), Tr(TextId::SettingsMenu));
         AppendMenuW(context, MF_STRING, IDM_EXIT, Tr(TextId::Exit));
         TrackPopupMenu(context, TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, nullptr);
